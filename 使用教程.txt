@@ -17,11 +17,8 @@ python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
 
 # 保存输出视频
 python main.py --num_cams 2 --cam_ids 0 1 --save_output
-```
-会打开摄像头，实时检测人体姿态并判断跌倒。按 ESC 退出。
 
-如果想用视频文件而不是摄像头，编辑 main.py 把这两行互换：
+# 运行模拟测试（不需要摄像头）
+python test_fall_detection.py
 
-
-cap = cv2.VideoCapture("你的视频路径.mp4")  # 取消注释这行
-# cap = cv2.VideoCapture(0)                  # 注释掉这行
+按 ESC 退出。
