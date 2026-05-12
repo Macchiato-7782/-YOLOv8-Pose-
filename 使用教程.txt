@@ -1,8 +1,23 @@
 运行方式
 打开终端，执行：
+cd ~/Desktop/学习资料/Real-Time-Fall-Detection
+source venv/bin/activate
 
+# 单摄像头
+python main.py
 
+# 单视频文件
+python main.py --video your_video.mp4
 
+# 双摄像头
+python main.py --num_cams 2 --cam_ids 0 1
+
+# 双视频文件
+python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
+
+# 保存输出视频
+python main.py --num_cams 2 --cam_ids 0 1 --save_output
+```
 会打开摄像头，实时检测人体姿态并判断跌倒。按 ESC 退出。
 
 如果想用视频文件而不是摄像头，编辑 main.py 把这两行互换：

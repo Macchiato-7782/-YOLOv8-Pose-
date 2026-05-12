@@ -1,330 +1,526 @@
+"""
+实时跌倒检测系统
+支持单摄像头和双摄像头模式
+
+单摄像头: python main.py
+双摄像头: python main.py --num_cams 2 --cam_ids 0 1
+双视频:   python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
+"""
+
 import cv2
+import os
 import time
+import torch
+import argparse
 import numpy as np
+import traceback
+import multiprocessing as mp
 from ultralytics import YOLO
 
-# --- Constants and Thresholds ---
-# For YOLOv8 Pose Model
-MODEL_PATH = 'yolov8n-pose.pt' # Or use yolov8m-pose.pt, yolov8l-pose.pt for potentially better accuracy but slower
-MIN_CONF_DETECTION = 0.5 # Minimum confidence for a person detection by YOLO
-MIN_CONF_KPT = 0.3       # Minimum confidence for a keypoint to be considered visible/reliable
+from tracking import SingleCameraTracker
+from cross_camera import match_cross_camera, remove_wrongly_matched, get_color_histogram, merge_tracking_ids
+from fall_logic import evaluate_fall, calculate_angle
+from features import yolo_to_5keypoints
+from camera_process import camera_process, extract_angle_keypoints, compute_iou, ROI_ENABLED, ROI_CONF, ROI_EXPAND_RATIO, ROI_MATCH_IOU, ROI_MAX_TIME, IOU_DEDUP_THRESHOLD
 
-# Keypoints for determining 'Full Body' visibility and calculating Bounding Box (YOLO indices)
-# Indices: [0 (Nose), 5 (LShoulder), 6 (RShoulder), 11 (LHip), 12 (RHip), 15 (LAnkle), 16 (RAnkle)]
-REQUIRED_KPTS_FOR_FULL_BODY = [0, 5, 6, 11, 12, 15, 16]
-MIN_KPTS_FOR_FULL_BODY = 5 # Minimum number of required keypoints visible for 'Full Body' status and valid box/tracking
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL = os.path.join(SCRIPT_DIR, 'yolov8n-pose.pt')
 
-# Keypoints for Angle calculation (YOLO indices)
-# We'll check Left Shoulder=5, Left Hip=11, Left Knee=13
-ANGLE_KPTS_INDICES = {
-    'shoulder': 5, # Left Shoulder
-    'hip': 11,     # Left Hip (Vertex of the angle)
-    'knee': 13     # Left Knee
-}
-MIN_CONF_FOR_ANGLE_KPTS = 0.3 # Minimum confidence for the specific angle keypoints
-
-# Fall Detection Criteria Thresholds
-HORIZONTAL_AR_THRESHOLD = 0.6     # Ratio of height / width for horizontal pose detection
-ANGLE_THRESHOLD = 140              # Degrees for the hip angle (e.g., < 60 degrees is considered a collapsed torso)
-MIN_FALL_POSE_DURATION = 1.0      # Seconds a potential fall pose (low AR or low Angle) must be held
-
-# Tracking Parameters
-TRACKING_DISTANCE_THRESHOLD = 150 # Max pixel distance for matching a person across frames
-HISTORY_CLEANUP_INTERVAL = 5      # Seconds to keep track of a person after they disappear
-
-
-# cap = cv2.VideoCapture("videoplayback.mp4")  # Video file
-# cap = cv2.VideoCapture(0)  # Webcam (may pick iPhone via Continuity Camera)
-cap = cv2.VideoCapture(1)  # Try built-in FaceTime camera
-
-
-calculated_angles = []
-
-# --- Helper Function ---
-def calculate_angle(a, b, c):
-    """Calculates the angle in degrees between three points (shoulder, hip, knee)."""
-    a = np.array(a) # Shoulder
-    b = np.array(b) # Hip (vertex)
-    c = np.array(c) # Knee
-
-    # Ensure points are distinct to avoid errors (though confidence check should largely prevent this)
-    if np.array_equal(a, b) or np.array_equal(b, c):
-         return 180.0 # Assume upright if points are the same
-
-    # Calculate angles relative to the positive x-axis
-    vec_ba = a - b
-    vec_bc = c - b
-
-    # Compute the angle using atan2 for robustness across quadrants
-    radians = np.arctan2(vec_bc[1], vec_bc[0]) - np.arctan2(vec_ba[1], vec_ba[0])
-    angle = np.abs(np.degrees(radians)) # Convert to degrees
-
-    # Normalize angle to be between 0 and 180
-    if angle > 180.0:
-        angle = 360 - angle
-
-    # print(f"Angle calculation: Shoulder={a}, Hip={b}, Knee={c}, Calculated Angle={angle:.2f}") # Detailed Debug
-    return angle
-
-# --- Load Model ---
 try:
-    model = YOLO(MODEL_PATH)
-except Exception as e:
-    print(f"Error loading YOLO model from {MODEL_PATH}: {e}")
-    print("Please ensure you have 'ultralytics' installed (`pip install ultralytics`)")
-    print(f"and the model file '{MODEL_PATH}' exists or is accessible.")
-    exit()
-
-# --- Person Tracking State ---
-# Stores state for each tracked person
-person_history = {}
-next_person_id = 1
-last_cleanup_time = time.time()
-
-# --- Main Processing Loop ---
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("End of video or cannot read frame.")
-        break # End of video
-
-    current_time = time.time()
-
-    # Run YOLO inference
-    # Setting verbose=False reduces console output
-    # conf=MIN_CONF_DETECTION filters initial person detection confidence
-    results = model(frame, conf=MIN_CONF_DETECTION, verbose=False)[0]
-
-    # Keep track of which history IDs were matched by a full-body detection this frame
-    matched_full_body_pids_this_frame = set()
-
-    # Store minimal drawing info for persons detected as full-body this frame
-    # This helps in drawing custom labels later over the results.plot() output
-    drawing_info_this_frame = {} # {pid: {'box': (x1,y1,x2,y2), 'center': (cx,cy), 'status_color': (B,G,R), 'label_text': '...'}}
+    mp.set_start_method('spawn')
+except RuntimeError:
+    pass
 
 
-    # --- Phase 1: Process Raw Detections, Extract Info, Check Full Body, Update History for Full Body ---
-    # results.keypoints gives a list of Keypoints objects, one for each person detection
-    for i, pose in enumerate(results.keypoints):
+# ============================================================
+# 绘图工具
+# ============================================================
 
-        # Check for missing keypoint data
-        if pose.conf is None or len(pose.conf) == 0 or pose.xy is None or len(pose.xy) == 0 or len(pose.xy[0]) < 17:
-             # print(f"Skipping detection {i}: Incomplete keypoint data.") # Debug
-             continue # Skip this pose if keypoint data is missing or malformed
+def draw_person_info(frame, person, fall_result, global_id=None):
+    """在画面上绘制单个人的信息"""
+    pid = person.get('pid', '?')
+    x1, y1, x2, y2 = person['bbox']
+    state = fall_result['state']
 
-        keypoints = pose.xy[0].cpu().numpy() # Shape (17, 2)
-        confs = pose.conf[0].cpu().numpy() # Shape (17,)
+    # 颜色和边框粗细
+    if 'FALL' in state:
+        color = (0, 0, 255)  # 红色
+        thickness = 4
+    elif state == 'Potential Fall':
+        color = (0, 165, 255)  # 橙色
+        thickness = 3
+    else:
+        color = (0, 255, 0)  # 绿色
+        thickness = 2
 
-        # --- Check for 'Full Body' visibility & Calculate Bounding Box from Keypoints ---
-        visible_relevant_kpts_coords = []
-        for idx in REQUIRED_KPTS_FOR_FULL_BODY:
-            # Check if index is valid for the keypoints array, keypoint is visible (>0) and confident
-            if idx < len(keypoints) and keypoints[idx][0] > 0 and keypoints[idx][1] > 0 and confs[idx] > MIN_CONF_KPT:
-                visible_relevant_kpts_coords.append(keypoints[idx])
+    # 确认跌倒：半透明红色遮罩
+    if 'FALL' in state:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 200), -1)
+        cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
 
-        # Determine if 'Full Body' is visible
-        is_full_body_visible_this_detection = (len(visible_relevant_kpts_coords) >= MIN_KPTS_FOR_FULL_BODY)
+    # 边框
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-        # Calculate box coordinates from visible relevant keypoints (Needed for AR, Center, and Label position)
-        x1, y1, x2, y2, w, h, center = None, None, None, None, None, None, None
-        aspect_ratio = None
+    # 标签
+    label = f"G{global_id}: {state}" if global_id is not None else f"ID {pid}: {state}"
 
-        if len(visible_relevant_kpts_coords) >= 2: # Need at least 2 points to define a box min/max
-             try:
-                 visible_relevant_kpts_coords = np.array(visible_relevant_kpts_coords)
-                 x1_kpt, y1_kpt = visible_relevant_kpts_coords.min(axis=0)
-                 x2_kpt, y2_kpt = visible_relevant_kpts_coords.max(axis=0)
-                 x1, y1, x2, y2 = map(int, [x1_kpt, y1_kpt, x2_kpt, y2_kpt])
-                 w, h = x2 - x1, y2 - y1
-                 if w > 0 and h > 0:
-                     center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                     aspect_ratio = h / w
-                 else:
-                     # Invalid box dimensions
-                     x1, y1, x2, y2 = None, None, None, None # Invalidate box if dimensions are non-positive
-             except ValueError:
-                 # print(f"Detection {i}: Could not calculate min/max for bounding box.") # Debug
-                 pass # Ignore if min/max calculation fails
+    fall_state = person.get('fall_state', {})
+    if fall_state.get('is_potential_fall') and fall_state.get('fall_start_time'):
+        duration = time.time() - fall_state['fall_start_time']
+        label += f" ({duration:.1f}s)"
+
+    if fall_result.get('confidence', 0) > 0:
+        label += f" [{fall_result['confidence']:.0%}]"
+
+    # 标签文字（跌倒时更大）
+    font_scale = 0.8 if 'FALL' in state else 0.6
+    text_y = max(y1 - 10, 20)
+    cv2.putText(frame, label, (max(x1, 5), text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 2)
+
+    return frame
 
 
-        # If we can't get a valid center or box, this detection isn't usable for tracking/logic
-        if center is None or x1 is None:
-            # print(f"Skipping detection {i}: Could not derive valid box/center.") # Debug
+def draw_fall_alert(frame, fall_results):
+    """如果检测到跌倒，在画面顶部画警告横幅"""
+    has_fall = any('FALL' in r['state'] for r in fall_results)
+    if not has_fall:
+        return frame
+
+    h, w = frame.shape[:2]
+    # 闪烁效果：根据时间取反色
+    blink = int(time.time() * 3) % 2 == 0
+    banner_color = (0, 0, 200) if blink else (0, 0, 255)
+
+    # 红色横幅
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, 50), banner_color, -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    # 警告文字
+    cv2.putText(frame, "!! FALL DETECTED !!", (w // 2 - 200, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3)
+
+    return frame
+
+
+def draw_skeleton(frame, results):
+    """使用 YOLO 内置方法绘制骨骼"""
+    return results.plot()
+
+
+# ============================================================
+# 单摄像头模式（保持原有功能）
+# ============================================================
+
+def run_single_camera(args):
+    """单摄像头模式"""
+    model = YOLO(args.model)
+
+    if args.video:
+        cap = cv2.VideoCapture(args.video[0])
+    elif args.cam_ids:
+        cap = cv2.VideoCapture(args.cam_ids[0])
+    else:
+        cap = cv2.VideoCapture(1)
+
+    if not cap.isOpened():
+        print("无法打开摄像头/视频")
+        return
+
+    tracker = SingleCameraTracker()
+    output_video = None
+    low_conf_rois = []
+
+    print("单摄像头模式启动，按 ESC 退出")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("视频结束或无法读取帧")
+            break
+
+        current_time = time.time()
+
+        # YOLO 推理（降低阈值以检测躺卧姿态）
+        results = model(frame, conf=0.3, verbose=False)[0]
+
+        # 提取主推理检测结果
+        main_detections = tracker.extract_detections(results)
+
+        # ROI 二次推理：只保留与已有目标重叠的检测（过滤假检）
+        roi_detections = []
+        roi_start = time.time()
+        if ROI_ENABLED and low_conf_rois:
+            try:
+                frame_h, frame_w = frame.shape[:2]
+                for roi in low_conf_rois:
+                    if time.time() - roi_start > ROI_MAX_TIME:
+                        break
+                    roi_bbox = roi['bbox']
+                    rx1, ry1, rx2, ry2 = roi_bbox
+                    w, h_roi = rx2 - rx1, ry2 - ry1
+                    ex1 = max(0, int(rx1 - w * ROI_EXPAND_RATIO))
+                    ey1 = max(0, int(ry1 - h_roi * ROI_EXPAND_RATIO))
+                    ex2 = min(frame_w, int(rx2 + w * ROI_EXPAND_RATIO))
+                    ey2 = min(frame_h, int(ry2 + h_roi * ROI_EXPAND_RATIO))
+
+                    crop = frame[ey1:ey2, ex1:ex2]
+                    if crop.size == 0:
+                        continue
+                    crop_results = model(crop, conf=ROI_CONF, verbose=False)[0]
+
+                    if crop_results.boxes is not None and len(crop_results.boxes) > 0:
+                        data = crop_results.boxes.data.clone()
+                        data[:, 0] += ex1
+                        data[:, 1] += ey1
+                        data[:, 2] += ex1
+                        data[:, 3] += ey1
+                        crop_results.boxes.data = data
+                    if crop_results.keypoints is not None:
+                        for kp in crop_results.keypoints:
+                            if kp.xy is not None:
+                                kp.data = kp.data.clone()
+                                kp.data[..., 0] += ex1
+                                kp.data[..., 1] += ey1
+
+                    roi_dets = tracker.extract_detections(crop_results)
+                    for det in roi_dets:
+                        if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
+                            roi_detections.append(det)
+            except Exception as e:
+                print(f"ROI 推理异常: {e}")
+                roi_detections = []
+
+        # 合并去重
+        all_detections = main_detections + roi_detections
+        merged = []
+        for det in all_detections:
+            dup = False
+            for m in merged:
+                if compute_iou(det['bbox'], m['bbox']) > IOU_DEDUP_THRESHOLD:
+                    dup = True
+                    break
+            if not dup:
+                merged.append(det)
+
+        # 跟踪更新
+        tracked = tracker.update(merged, current_time)
+        tracker.cleanup(current_time)
+
+        # 绘制骨骼
+        plotted_frame = draw_skeleton(frame, results)
+
+        # 跌倒判断 + 绘制
+        for person in tracked:
+            try:
+                kpts = person.get('keypoints')
+                confs = person.get('confs')
+                if kpts is not None and confs is not None:
+                    person['angle_keypoints'] = extract_angle_keypoints(kpts, confs)
+                else:
+                    person['angle_keypoints'] = None
+
+                fall_result = evaluate_fall(person, current_time)
+                person['fall_result'] = fall_result
+                plotted_frame = draw_person_info(plotted_frame, person, fall_result)
+            except Exception as e:
+                print(f"单摄处理异常: {e}")
+                traceback.print_exc()
+
+        # 更新 ROI 二次推理区域
+        low_conf_rois = []
+        for person in tracked:
+            if person.get('fall_result', {}).get('state') in ('Potential Fall', 'FALL'):
+                low_conf_rois.append({'bbox': person['bbox'], 'pid': person['pid']})
+
+        # 跌倒警告横幅
+        fall_results = [p['fall_result'] for p in tracked if 'fall_result' in p]
+        plotted_frame = draw_fall_alert(plotted_frame, fall_results)
+
+        # 保存输出
+        if args.save_output and output_video is None:
+            fourcc = cv2.VideoWriter_fourcc(*'MP42')
+            output_video = cv2.VideoWriter(
+                filename='output.avi', fourcc=fourcc,
+                fps=18, frameSize=(plotted_frame.shape[1], plotted_frame.shape[0])
+            )
+        if output_video is not None:
+            output_video.write(plotted_frame)
+
+        cv2.imshow("Fall Detection - Single Camera", plotted_frame)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            print("ESC 退出")
+            break
+
+    cap.release()
+    if output_video:
+        output_video.release()
+    cv2.destroyAllWindows()
+
+
+# ============================================================
+# 双摄像头模式
+# ============================================================
+
+def run_dual_camera(args):
+    """双摄像头模式：多进程 + 跨摄像头匹配"""
+    model_path = args.model
+    stop_event = mp.Event()
+    queue_a = mp.Queue(maxsize=1)
+    queue_b = mp.Queue(maxsize=1)
+
+    # 确定摄像头来源
+    if args.video:
+        cam_a = args.video[0]
+        cam_b = args.video[1]
+        is_video = True
+    else:
+        cam_a = args.cam_ids[0] if args.cam_ids else 0
+        cam_b = args.cam_ids[1] if len(args.cam_ids) > 1 else 1
+        is_video = False
+
+    # 启动两个摄像头进程（错开启动避免资源冲突）
+    p1 = mp.Process(target=camera_process, args=(cam_a, queue_a, model_path, stop_event, is_video))
+    p1.start()
+    time.sleep(2)  # 等第一个摄像头稳定后再启动第二个
+    p2 = mp.Process(target=camera_process, args=(cam_b, queue_b, model_path, stop_event, is_video))
+    p2.start()
+
+    print(f"双摄像头模式启动: Camera A={cam_a}, Camera B={cam_b}")
+    print("按 ESC 退出")
+
+    output_video = None
+    global_id_map = {}
+    cam_a_alive = True
+    cam_b_alive = True
+    data_a = None
+    data_b = None
+    # 主进程持久化 fall_state（camera_process 每帧传来的是新 dict，必须在主进程跨帧保存）
+    fall_state_store = {}  # key: (camera_label, pid), value: fall_state dict
+
+    def get_latest(queue):
+        """排空队列旧帧，只取最新一帧（非阻塞，无数据返回 None）"""
+        data = None
+        while not queue.empty():
+            try:
+                newer = queue.get_nowait()
+                if newer is None:
+                    return 'STOP'  # 摄像头进程结束信号
+                data = newer
+            except Exception:
+                break
+        return data
+
+    while cam_a_alive or cam_b_alive:
+        # 非阻塞获取最新帧
+        if cam_a_alive:
+            new_a = get_latest(queue_a)
+            if new_a == 'STOP':
+                print("摄像头 A 结束")
+                cam_a_alive = False
+                data_a = None
+            elif new_a is not None:
+                data_a = new_a
+
+        if cam_b_alive:
+            new_b = get_latest(queue_b)
+            if new_b == 'STOP':
+                print("摄像头 B 结束")
+                cam_b_alive = False
+                data_b = None
+            elif new_b is not None:
+                data_b = new_b
+
+        # 两边都没数据，等一下再试
+        if data_a is None and data_b is None:
+            if not cam_a_alive and not cam_b_alive:
+                break
+            time.sleep(0.01)
             continue
 
+        # 至少有一边有数据，取 current_time
+        current_time = (data_a or data_b)['timestamp']
 
-        # --- Match with Person History & Update State (Only if Full Body) ---
-        matched_id = None
+        # 处理摄像头 A
+        if data_a is not None:
+            frame_a = data_a['frame'].copy()
+            tracked_a = data_a['tracked']
+            frame_a = draw_skeleton(frame_a, data_a['results'])
+        else:
+            frame_a = None
+            tracked_a = []
 
-        # Find matching person in history based on the calculated center
-        for pid, data in list(person_history.items()): # Iterate copy in case we add new ID
-             dist = np.sqrt((center[0] - data['center'][0])**2 + (center[1] - data['center'][1])**2)
-             # Check distance AND that this history ID hasn't been matched by another (preferably full-body) detection this frame
-             # Simple check: if pid already matched by a full-body, skip subsequent matches for it in this frame
-             if dist < TRACKING_DISTANCE_THRESHOLD and pid not in matched_full_body_pids_this_frame:
-                 matched_id = pid
-                 break
+        # 处理摄像头 B
+        if data_b is not None:
+            frame_b = data_b['frame'].copy()
+            tracked_b = data_b['tracked']
+            frame_b = draw_skeleton(frame_b, data_b['results'])
+        else:
+            frame_b = None
+            tracked_b = []
 
-        if matched_id is None:
-             # This detection didn't match any existing track
-             # ONLY create a new track if it's a full body detection
-             if is_full_body_visible_this_detection:
-                  matched_id = next_person_id
-                  next_person_id += 1
-                  person_history[matched_id] = {
-                      'center': center,
-                      'is_potential_fall_pose': False,
-                      'fall_pose_start_time': None,
-                      'fall_detected': False,
-                      'last_seen': current_time,
-                      'current_frame_box': (x1, y1, x2, y2), # Store box for drawing this frame
-                      'is_full_body_this_frame': True # Mark that this update came from a full body detection
-                  }
-                  matched_full_body_pids_this_frame.add(matched_id)
-                  # print(f"New person (Full Body): ID {matched_id}") # Debug)
+        # 跨摄像头匹配（两边都有数据时才做）
+        matched_pairs = []
+        pid_to_global_a = {}
+        pid_to_global_b = {}
+        if tracked_a and tracked_b:
+            matched_pairs = match_cross_camera(tracked_a, tracked_b)
+            matched_pairs = remove_wrongly_matched(tracked_a, tracked_b, matched_pairs)
+            merge_tracking_ids(tracked_a, tracked_b, matched_pairs, global_id_map)
 
-        # If a match was found (either existing or new full body)
-        if matched_id is not None:
-             person_data = person_history[matched_id]
+            for a_idx, b_idx in matched_pairs:
+                pid_a = tracked_a[a_idx]['pid']
+                pid_b = tracked_b[b_idx]['pid']
+                global_id = global_id_map.get((pid_a, pid_b))
+                if global_id is not None:
+                    pid_to_global_a[pid_a] = global_id
+                    pid_to_global_b[pid_b] = global_id
 
-             # Always update location and last seen time for matched tracks
-             person_data['center'] = center
-             person_data['last_seen'] = current_time
-             person_data['current_frame_box'] = (x1, y1, x2, y2) # Store box for drawing this frame
-             person_data['is_full_body_this_frame'] = is_full_body_visible_this_detection # Mark the type of detection
+        # 跌倒判断 + 绘制（摄像头 A）
+        if frame_a is not None:
+            for person in tracked_a:
+                try:
+                    # 从主进程持久化存储恢复 fall_state（camera_process 每帧传来新 dict）
+                    store_key = ('A', person['pid'])
+                    if store_key in fall_state_store:
+                        person['fall_state'] = fall_state_store[store_key]
 
-             # ONLY update fall state if the CURRENT detection is Full Body
-             if is_full_body_visible_this_detection:
-                  matched_full_body_pids_this_frame.add(matched_id) # Ensure this PID is marked as having a full body match
+                    dual_cam_fall = None
+                    for a_idx, b_idx in matched_pairs:
+                        if tracked_a[a_idx]['pid'] == person['pid']:
+                            dual_cam_fall = tracked_b[b_idx].get('fall_result', {}).get('fall_detected', False)
+                            break
 
-                  # Calculate Angle (Left Shoulder-Left Hip-Left Knee) if available
-                  angle = None # Reset angle check for this full-body update
-                  angle_kpts_coords = {}
-                  angle_kpts_available = True
-                  for name, idx in ANGLE_KPTS_INDICES.items():
-                       # Use keypoints from the current detection
-                       if idx < len(keypoints) and keypoints[idx][0] > 0 and keypoints[idx][1] > 0 and confs[idx] > MIN_CONF_FOR_ANGLE_KPTS:
-                           angle_kpts_coords[name] = (keypoints[idx][0], keypoints[idx][1])
-                       else:
-                           angle_kpts_available = False
-                           break # Need all three points for the angle
+                    fall_result = evaluate_fall(person, current_time, dual_cam_fall)
+                    person['fall_result'] = fall_result
+                    fall_state_store[store_key] = person['fall_state']  # 持久化
+                    gid = pid_to_global_a.get(person['pid'])
+                    frame_a = draw_person_info(frame_a, person, fall_result, global_id=gid)
+                except Exception as e:
+                    print(f"Camera A 处理异常: {e}")
+                    traceback.print_exc()
 
-                  if angle_kpts_available:
-                       try:
-                            angle = calculate_angle(angle_kpts_coords['shoulder'], angle_kpts_coords['hip'], angle_kpts_coords['knee'])
-                            # User requested angle logging - keep for debugging
-                            calculated_angles.append(angle)
-                       except Exception as e:
-                            # print(f"Person {matched_id}: Error calculating angle: {e}") # Debug
-                            angle = None
+        # 跌倒判断 + 绘制（摄像头 B）
+        if frame_b is not None:
+            for person in tracked_b:
+                try:
+                    # 从主进程持久化存储恢复 fall_state
+                    store_key = ('B', person['pid'])
+                    if store_key in fall_state_store:
+                        person['fall_state'] = fall_state_store[store_key]
 
-                  # Determine if currently in a "Potential Fall Pose" based on Full Body AR/Angle
-                  is_potential_fall_pose_this_frame = False
-                  if aspect_ratio is not None and aspect_ratio < HORIZONTAL_AR_THRESHOLD:
-                       is_potential_fall_pose_this_frame = True
-                       # print(f"Person {matched_id}: Full Body -> Low AR ({aspect_ratio:.2f})") # Debug)
+                    dual_cam_fall = None
+                    for a_idx, b_idx in matched_pairs:
+                        if tracked_b[b_idx]['pid'] == person['pid']:
+                            dual_cam_fall = tracked_a[a_idx].get('fall_result', {}).get('fall_detected', False)
+                            break
 
-                  if angle is not None and angle < ANGLE_THRESHOLD:
-                       is_potential_fall_pose_this_frame = True
-                       # print(f"Person {matched_id}: Full Body -> Low Angle ({angle:.2f})") # Debug)
+                    fall_result = evaluate_fall(person, current_time, dual_cam_fall)
+                    person['fall_result'] = fall_result
+                    fall_state_store[store_key] = person['fall_state']  # 持久化
+                    gid = pid_to_global_b.get(person['pid'])
+                    frame_b = draw_person_info(frame_b, person, fall_result, global_id=gid)
+                except Exception as e:
+                    print(f"Camera B 处理异常: {e}")
+                    traceback.print_exc()
 
+        # 清理 fall_state_store 中消失的 PID（防止内存泄漏）
+        active_keys = set()
+        for p in tracked_a:
+            active_keys.add(('A', p['pid']))
+        for p in tracked_b:
+            active_keys.add(('B', p['pid']))
+        stale_keys = [k for k in fall_state_store if k not in active_keys]
+        for k in stale_keys:
+            del fall_state_store[k]
 
-                  # Update State and Timer based on Potential Fall Pose (only if the source was full body)
-                  if is_potential_fall_pose_this_frame:
-                       if not person_data['is_potential_fall_pose']:
-                           # Transition from normal to potential fall pose
-                           person_data['is_potential_fall_pose'] = True
-                           person_data['fall_pose_start_time'] = current_time
-                           # print(f"Person {matched_id}: Started potential fall pose at {current_time:.2f}") # Debug)
-                  else:
-                       # Not in a potential fall pose this frame (for a full body detection)
-                       if person_data['is_potential_fall_pose']:
-                           # Transition from potential fall pose to normal state (clears timer)
-                           person_data['is_potential_fall_pose'] = False
-                           person_data['fall_pose_start_time'] = None
-                           # print(f"Person {matched_id}: Exited potential fall pose") # Debug)
+        # 跌倒警告横幅
+        fall_results_a = [p['fall_result'] for p in tracked_a if 'fall_result' in p]
+        fall_results_b = [p['fall_result'] for p in tracked_b if 'fall_result' in p]
+        if frame_a is not None:
+            frame_a = draw_fall_alert(frame_a, fall_results_a)
+        if frame_b is not None:
+            frame_b = draw_fall_alert(frame_b, fall_results_b)
 
-                  # Check for Fall Detection based on Duration (only if currently in potential pose state)
-                  fall_detected_for_person = False
-                  if person_data['is_potential_fall_pose'] and person_data['fall_pose_start_time'] is not None:
-                        duration = current_time - person_data['fall_pose_start_time']
-                        # print(f"Person {matched_id}: Potential fall duration: {duration:.2f}s") # Debug)
-                        if duration >= MIN_FALL_POSE_DURATION:
-                            fall_detected_for_person = True
-                            # print(f"Person {matched_id}: >>> FALL DETECTED! <<<") # Debug)
+        # FPS 信息
+        if frame_a is not None and data_a is not None:
+            fps_a = data_a.get('fps', 0)
+            cv2.putText(frame_a, f"FPS: {fps_a:.0f}", (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        if frame_b is not None and data_b is not None:
+            fps_b = data_b.get('fps', 0)
+            cv2.putText(frame_b, f"FPS: {fps_b:.0f}", (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-                  person_data['fall_detected'] = fall_detected_for_person # Update the fall status for this person
+        # 组合画面（支持单边或双边）
+        if frame_a is not None and frame_b is not None:
+            h = max(frame_a.shape[0], frame_b.shape[0])
+            if frame_a.shape[0] != h:
+                frame_a = cv2.resize(frame_a, (int(frame_a.shape[1] * h / frame_a.shape[0]), h))
+            if frame_b.shape[0] != h:
+                frame_b = cv2.resize(frame_b, (int(frame_b.shape[1] * h / frame_b.shape[0]), h))
+            combined = np.hstack((frame_a, frame_b))
+        elif frame_a is not None:
+            combined = frame_a
+        else:
+            combined = frame_b
 
-             # Prepare drawing info for this matched person (regardless of full body status this frame)
-             color = (0, 0, 255) if person_data['fall_detected'] else (0, 255, 0) # Red/Green
-             if person_data['is_potential_fall_pose'] and not person_data['fall_detected']:
-                  color = (0, 165, 255) # Orange/Yellow for "Potential Fall Pose" state
+        # 保存输出
+        if args.save_output and output_video is None:
+            fourcc = cv2.VideoWriter_fourcc(*'MP42')
+            output_video = cv2.VideoWriter(
+                filename='output_dual.avi', fourcc=fourcc,
+                fps=18, frameSize=(combined.shape[1], combined.shape[0])
+            )
+        if output_video is not None:
+            output_video.write(combined)
 
-             label = f"ID {matched_id}: {'Fall' if person_data['fall_detected'] else 'Normal'}"
-             # Add duration for potential/confirmed fall states
-             if person_data['is_potential_fall_pose'] and person_data['fall_pose_start_time'] is not None:
-                  duration_str = f"({current_time - person_data['fall_pose_start_time']:.1f}s)"
-                  label += " " + duration_str
-             # Optional debug info
-             # if aspect_ratio is not None: label += f" AR={aspect_ratio:.1f}"
-             # if angle is not None: label += f" Angle={angle:.0f}"
-             # label += f" FB={str(person_data.get('is_full_body_this_frame', False))[0]}" # Add FB status char
+        cv2.imshow("Dual Camera Fall Detection", combined)
 
-             drawing_info_this_frame[matched_id] = {
-                  'box': person_data['current_frame_box'], # Use the box from this frame's detection
-                  'status_color': color,
-                  'label_text': label
-             }
-        # else: # Detection was not Full Body and didn't match an existing track - ignored for history
+        if cv2.waitKey(1) & 0xFF == 27:
+            print("ESC 退出")
+            stop_event.set()
+            break
 
-    # --- Phase 2: History Cleanup ---
-    # Remove persons from history who haven't been seen (full body or not) for a while
-    if current_time - last_cleanup_time > HISTORY_CLEANUP_INTERVAL:
-        ids_to_remove = [
-            pid for pid, data in person_history.items()
-            if current_time - data['last_seen'] > HISTORY_CLEANUP_INTERVAL
-        ]
-        for pid in ids_to_remove:
-            # print(f"Removing person {pid} from history (not seen for > {HISTORY_CLEANUP_INTERVAL}s)") # Debug)
-            del person_history[pid]
-        last_cleanup_time = current_time
-
-    # --- Phase 3: Drawing Results ---
-
-    # Use YOLO's built-in plot function to draw all detections and keypoints
-    # This includes persons detected as full-body and those not.
-    plotted_frame = results.plot() # This returns a new frame with drawings
-
-    # Draw custom labels for tracked persons who were matched this frame
-    # (using info prepared in Phase 1)
-    for pid, info in drawing_info_this_frame.items():
-        box = info['box']
-        if box is not None: # Ensure we have a valid box from this frame's detection for position
-            x1, y1, x2, y2 = box
-            color = info['status_color']
-            label = info['label_text']
-
-            # Draw the label text
-            text_y_pos = max(y1 - 10, 20) # Put text 10px above box, but at least 20px from top
-            # Ensure text doesn't go off the left edge either
-            text_x_pos = max(x1, 5)
-            cv2.putText(plotted_frame, label, (text_x_pos, text_y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    p1.join(timeout=5)
+    p2.join(timeout=5)
+    if output_video:
+        output_video.release()
+    cv2.destroyAllWindows()
 
 
-    # --- Display Frame ---
-    cv2.imshow("Fall Detection (Combined AR + Angle + Duration + Full Body Filter)", plotted_frame)
+# ============================================================
+# 入口
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="实时跌倒检测系统 - 支持单/双摄像头",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--model', type=str, default=DEFAULT_MODEL,
+                        help='YOLOv8 姿态估计模型路径')
+    parser.add_argument('--num_cams', type=int, default=1,
+                        help='摄像头数量 (1 或 2)')
+    parser.add_argument('--cam_ids', type=int, nargs='+', default=[1],
+                        help='摄像头 ID 列表')
+    parser.add_argument('--video', type=str, nargs='+', default=None,
+                        help='视频文件路径（替代摄像头）')
+    parser.add_argument('--save_output', action='store_true',
+                        help='保存输出视频')
+
+    args = parser.parse_args()
+
+    if args.num_cams == 1:
+        run_single_camera(args)
+    elif args.num_cams == 2:
+        run_dual_camera(args)
+    else:
+        print(f"不支持 {args.num_cams} 个摄像头，目前只支持 1 或 2")
 
 
-    # --- Exit Condition ---
-    # Press ESC key to exit
-    if cv2.waitKey(1) & 0xFF == 27:
-        print("ESC key pressed. Exiting.")
-        break
-
-# --- Release Resources ---
-cap.release()
-cv2.destroyAllWindows()
-
-# Print mean of angles if any were calculated (as requested by user)
-print("Mean of calculated angles:", np.mean(calculated_angles) if calculated_angles else "No angles calculated")
+if __name__ == "__main__":
+    main()
