@@ -10,6 +10,7 @@
 import cv2
 import os
 import time
+import logging
 import torch
 import argparse
 import numpy as np
@@ -17,11 +18,14 @@ import traceback
 import multiprocessing as mp
 from ultralytics import YOLO
 
+logger = logging.getLogger(__name__)
+
 from tracking import SingleCameraTracker
-from cross_camera import match_cross_camera, remove_wrongly_matched, get_color_histogram, merge_tracking_ids
-from fall_logic import evaluate_fall, calculate_angle
+from cross_camera import match_cross_camera, remove_wrongly_matched, merge_tracking_ids
+from fall_logic import evaluate_fall
 from features import yolo_to_5keypoints
-from camera_process import camera_process, extract_angle_keypoints, compute_iou, ROI_ENABLED, ROI_CONF, ROI_EXPAND_RATIO, ROI_MATCH_IOU, ROI_MAX_TIME, IOU_DEDUP_THRESHOLD
+from camera_process import camera_process, extract_angle_keypoints, run_roi_inference
+from config import CAM_PROC
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.path.join(SCRIPT_DIR, 'yolov8n-pose.pt')
@@ -41,6 +45,24 @@ def draw_person_info(frame, person, fall_result, global_id=None):
     pid = person.get('pid', '?')
     x1, y1, x2, y2 = person['bbox']
     state = fall_result['state']
+    is_ghost = person.get('is_ghost', False)
+
+    # 幽灵目标：灰色虚线框，不画红色警报
+    if is_ghost:
+        color = (128, 128, 128)  # 灰色
+        # 虚线效果：每隔 10px 画一段
+        for i in range(x1, x2, 10):
+            cv2.line(frame, (i, y1), (min(i + 5, x2), y1), color, 2)
+            cv2.line(frame, (i, y2), (min(i + 5, x2), y2), color, 2)
+        for i in range(y1, y2, 10):
+            cv2.line(frame, (x1, i), (x1, min(i + 5, y2)), color, 2)
+            cv2.line(frame, (x2, i), (x2, min(i + 5, y2)), color, 2)
+        label = f"ID {pid}: LOST"
+        text_y = min(y1 + 20, y2 - 5)
+        text_x = max(x1 + 3, 5)
+        cv2.putText(frame, label, (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return frame
 
     # 颜色和边框粗细
     if 'FALL' in state:
@@ -73,18 +95,26 @@ def draw_person_info(frame, person, fall_result, global_id=None):
     if fall_result.get('confidence', 0) > 0:
         label += f" [{fall_result['confidence']:.0%}]"
 
-    # 标签文字（跌倒时更大）
+    # 标签文字（在 bbox 内部顶部，避免与相邻框重叠）
     font_scale = 0.8 if 'FALL' in state else 0.6
-    text_y = max(y1 - 10, 20)
-    cv2.putText(frame, label, (max(x1, 5), text_y),
+    text_y = min(y1 + 25, y2 - 5)
+    text_x = max(x1 + 3, 5)
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)
+    # 半透明背景矩形
+    bg_x2 = min(text_x + tw + 4, frame.shape[1] - 2)
+    bg_y1 = max(text_y - th - 4, 0)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (text_x - 2, bg_y1), (bg_x2, text_y + baseline + 2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.putText(frame, label, (text_x, text_y),
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 2)
 
     return frame
 
 
 def draw_fall_alert(frame, fall_results):
-    """如果检测到跌倒，在画面顶部画警告横幅"""
-    has_fall = any('FALL' in r['state'] for r in fall_results)
+    """如果检测到跌倒，在画面顶部画警告横幅（排除幽灵目标）"""
+    has_fall = any('FALL' in r['state'] and not r.get('is_ghost') for r in fall_results)
     if not has_fall:
         return frame
 
@@ -120,94 +150,75 @@ def run_single_camera(args):
 
     if args.video:
         cap = cv2.VideoCapture(args.video[0])
-    elif args.cam_ids:
-        cap = cv2.VideoCapture(args.cam_ids[0])
+        if not cap.isOpened():
+            logger.error(f"无法打开视频: {args.video[0]}")
+            return
     else:
-        cap = cv2.VideoCapture(1)
+        cap = None
+        cam_ids = args.cam_ids if args.cam_ids else [0]
+        for cam_id in cam_ids:
+            logger.info(f"尝试摄像头 {cam_id}...")
+            test_cap = cv2.VideoCapture(cam_id)
+            if test_cap.isOpened():
+                ret, _ = test_cap.read()
+                if ret:
+                    cap = test_cap
+                    logger.info(f"摄像头 {cam_id} 可用")
+                    break
+                else:
+                    logger.warning(f"摄像头 {cam_id} 能打开但无法读取帧")
+                    test_cap.release()
+            else:
+                logger.warning(f"摄像头 {cam_id} 无法打开")
+                test_cap.release()
 
-    if not cap.isOpened():
-        print("无法打开摄像头/视频")
-        return
+        if cap is None:
+            logger.error("所有摄像头均不可用")
+            return
 
     tracker = SingleCameraTracker()
     output_video = None
     low_conf_rois = []
+    frame_count = 0
+    fps_t0 = time.time()
 
-    print("单摄像头模式启动，按 ESC 退出")
+    logger.info("单摄像头模式启动，按 ESC 退出")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("视频结束或无法读取帧")
+            # 摄像头偶尔会读取失败，重试3次再放弃
+            for retry in range(3):
+                time.sleep(0.05)
+                ret, frame = cap.read()
+                if ret:
+                    break
+        if not ret:
+            logger.warning("视频结束或无法读取帧")
             break
 
         current_time = time.time()
+        frame_count += 1
 
-        # YOLO 推理（降低阈值以检测躺卧姿态）
-        results = model(frame, conf=0.3, verbose=False)[0]
+        try:
+            # ByteTracker 跟踪推理（卡尔曼滤波 + 级联匹配）
+            results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
 
-        # 提取主推理检测结果
-        main_detections = tracker.extract_detections(results)
+            # 提取跟踪结果
+            main_detections = tracker.extract_detections(results)
+            tracked = tracker.update(main_detections, current_time)
 
-        # ROI 二次推理：只保留与已有目标重叠的检测（过滤假检）
-        roi_detections = []
-        roi_start = time.time()
-        if ROI_ENABLED and low_conf_rois:
-            try:
-                frame_h, frame_w = frame.shape[:2]
-                for roi in low_conf_rois:
-                    if time.time() - roi_start > ROI_MAX_TIME:
-                        break
-                    roi_bbox = roi['bbox']
-                    rx1, ry1, rx2, ry2 = roi_bbox
-                    w, h_roi = rx2 - rx1, ry2 - ry1
-                    ex1 = max(0, int(rx1 - w * ROI_EXPAND_RATIO))
-                    ey1 = max(0, int(ry1 - h_roi * ROI_EXPAND_RATIO))
-                    ex2 = min(frame_w, int(rx2 + w * ROI_EXPAND_RATIO))
-                    ey2 = min(frame_h, int(ry2 + h_roi * ROI_EXPAND_RATIO))
+            # ROI 二次推理：每 N 帧推理一次，关联到已有 track
+            roi_interval = CAM_PROC.get('roi_interval', 3)
+            if frame_count % roi_interval == 0 and low_conf_rois:
+                roi_detections = run_roi_inference(model, frame, low_conf_rois, tracker)
+                tracker.update_roi(roi_detections, current_time)
 
-                    crop = frame[ey1:ey2, ex1:ex2]
-                    if crop.size == 0:
-                        continue
-                    crop_results = model(crop, conf=ROI_CONF, verbose=False)[0]
-
-                    if crop_results.boxes is not None and len(crop_results.boxes) > 0:
-                        data = crop_results.boxes.data.clone()
-                        data[:, 0] += ex1
-                        data[:, 1] += ey1
-                        data[:, 2] += ex1
-                        data[:, 3] += ey1
-                        crop_results.boxes.data = data
-                    if crop_results.keypoints is not None:
-                        for kp in crop_results.keypoints:
-                            if kp.xy is not None:
-                                kp.data = kp.data.clone()
-                                kp.data[..., 0] += ex1
-                                kp.data[..., 1] += ey1
-
-                    roi_dets = tracker.extract_detections(crop_results)
-                    for det in roi_dets:
-                        if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
-                            roi_detections.append(det)
-            except Exception as e:
-                print(f"ROI 推理异常: {e}")
-                roi_detections = []
-
-        # 合并去重
-        all_detections = main_detections + roi_detections
-        merged = []
-        for det in all_detections:
-            dup = False
-            for m in merged:
-                if compute_iou(det['bbox'], m['bbox']) > IOU_DEDUP_THRESHOLD:
-                    dup = True
-                    break
-            if not dup:
-                merged.append(det)
-
-        # 跟踪更新
-        tracked = tracker.update(merged, current_time)
-        tracker.cleanup(current_time)
+            tracker.cleanup(current_time)
+        except Exception as e:
+            logger.warning(f"检测/跟踪异常: {e}")
+            traceback.print_exc()
+            continue
 
         # 绘制骨骼
         plotted_frame = draw_skeleton(frame, results)
@@ -215,6 +226,13 @@ def run_single_camera(args):
         # 跌倒判断 + 绘制
         for person in tracked:
             try:
+                if person.get('is_ghost'):
+                    # 幽灵目标：保留之前的 fall_result，跳过重新计算
+                    if 'fall_result' not in person:
+                        person['fall_result'] = {'fall_detected': False, 'confidence': 0, 'state': 'Normal'}
+                    plotted_frame = draw_person_info(plotted_frame, person, person['fall_result'])
+                    continue
+
                 kpts = person.get('keypoints')
                 confs = person.get('confs')
                 if kpts is not None and confs is not None:
@@ -226,18 +244,39 @@ def run_single_camera(args):
                 person['fall_result'] = fall_result
                 plotted_frame = draw_person_info(plotted_frame, person, fall_result)
             except Exception as e:
-                print(f"单摄处理异常: {e}")
+                logger.warning(f"单摄处理异常: {e}")
                 traceback.print_exc()
 
-        # 更新 ROI 二次推理区域
+        # 更新 ROI 二次推理区域（仅潜在跌倒目标，用预测位置做 ROI 中心）
         low_conf_rois = []
         for person in tracked:
             if person.get('fall_result', {}).get('state') in ('Potential Fall', 'FALL'):
-                low_conf_rois.append({'bbox': person['bbox'], 'pid': person['pid']})
+                pid = person['pid']
+                predicted = tracker._predict_position(tracker.person_history.get(pid, {}))
+                low_conf_rois.append({
+                    'bbox': person['bbox'],
+                    'pid': pid,
+                    'predicted_center': predicted,
+                })
 
-        # 跌倒警告横幅
-        fall_results = [p['fall_result'] for p in tracked if 'fall_result' in p]
+        # 跌倒警告横幅（传入 is_ghost 标记）
+        fall_results = []
+        for p in tracked:
+            if 'fall_result' in p:
+                fr = dict(p['fall_result'])
+                fr['is_ghost'] = p.get('is_ghost', False)
+                fall_results.append(fr)
         plotted_frame = draw_fall_alert(plotted_frame, fall_results)
+
+        # FPS 显示
+        fps = frame_count / (time.time() - fps_t0 + 1e-8)
+        cv2.putText(plotted_frame, f"FPS: {fps:.0f}", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # 时间戳水印
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        cv2.putText(plotted_frame, timestamp, (10, plotted_frame.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         # 保存输出
         if args.save_output and output_video is None:
@@ -252,7 +291,7 @@ def run_single_camera(args):
         cv2.imshow("Fall Detection - Single Camera", plotted_frame)
 
         if cv2.waitKey(1) & 0xFF == 27:
-            print("ESC 退出")
+            logger.info("ESC 退出")
             break
 
     cap.release()
@@ -289,11 +328,12 @@ def run_dual_camera(args):
     p2 = mp.Process(target=camera_process, args=(cam_b, queue_b, model_path, stop_event, is_video))
     p2.start()
 
-    print(f"双摄像头模式启动: Camera A={cam_a}, Camera B={cam_b}")
-    print("按 ESC 退出")
+    logger.info(f"双摄像头模式启动: Camera A={cam_a}, Camera B={cam_b}")
+    logger.info("按 ESC 退出")
 
     output_video = None
     global_id_map = {}
+    pid_to_global_store = {}  # 反向索引：pid → global_id
     cam_a_alive = True
     cam_b_alive = True
     data_a = None
@@ -303,6 +343,7 @@ def run_dual_camera(args):
 
     def get_latest(queue):
         """排空队列旧帧，只取最新一帧（非阻塞，无数据返回 None）"""
+        import queue as _queue
         data = None
         while not queue.empty():
             try:
@@ -310,7 +351,7 @@ def run_dual_camera(args):
                 if newer is None:
                     return 'STOP'  # 摄像头进程结束信号
                 data = newer
-            except Exception:
+            except _queue.Empty:
                 break
         return data
 
@@ -319,7 +360,7 @@ def run_dual_camera(args):
         if cam_a_alive:
             new_a = get_latest(queue_a)
             if new_a == 'STOP':
-                print("摄像头 A 结束")
+                logger.info("摄像头 A 结束")
                 cam_a_alive = False
                 data_a = None
             elif new_a is not None:
@@ -328,7 +369,7 @@ def run_dual_camera(args):
         if cam_b_alive:
             new_b = get_latest(queue_b)
             if new_b == 'STOP':
-                print("摄像头 B 结束")
+                logger.info("摄像头 B 结束")
                 cam_b_alive = False
                 data_b = None
             elif new_b is not None:
@@ -369,15 +410,18 @@ def run_dual_camera(args):
         if tracked_a and tracked_b:
             matched_pairs = match_cross_camera(tracked_a, tracked_b)
             matched_pairs = remove_wrongly_matched(tracked_a, tracked_b, matched_pairs)
-            merge_tracking_ids(tracked_a, tracked_b, matched_pairs, global_id_map)
+            pid_to_global = merge_tracking_ids(tracked_a, tracked_b, matched_pairs, global_id_map, pid_to_global_store)
 
-            for a_idx, b_idx in matched_pairs:
-                pid_a = tracked_a[a_idx]['pid']
-                pid_b = tracked_b[b_idx]['pid']
-                global_id = global_id_map.get((pid_a, pid_b))
-                if global_id is not None:
-                    pid_to_global_a[pid_a] = global_id
-                    pid_to_global_b[pid_b] = global_id
+            # 从 pid_to_global 反向索引直接构建 pid→global 映射
+            for p in tracked_a:
+                gid = pid_to_global.get(p['pid'])
+                if gid is not None:
+                    pid_to_global_a[p['pid']] = gid
+            for p in tracked_b:
+                gid = pid_to_global.get(p['pid'])
+                if gid is not None:
+                    pid_to_global_b[p['pid']] = gid
+            pid_to_global_store = pid_to_global
 
         # 跌倒判断 + 绘制（摄像头 A）
         if frame_a is not None:
@@ -388,6 +432,15 @@ def run_dual_camera(args):
                     if store_key in fall_state_store:
                         person['fall_state'] = fall_state_store[store_key]
 
+                    gid = pid_to_global_a.get(person['pid'])
+
+                    if person.get('is_ghost'):
+                        # 幽灵目标：保留之前的 fall_result，跳过重新计算
+                        if 'fall_result' not in person:
+                            person['fall_result'] = {'fall_detected': False, 'confidence': 0, 'state': 'Normal'}
+                        frame_a = draw_person_info(frame_a, person, person['fall_result'], global_id=gid)
+                        continue
+
                     dual_cam_fall = None
                     for a_idx, b_idx in matched_pairs:
                         if tracked_a[a_idx]['pid'] == person['pid']:
@@ -397,10 +450,9 @@ def run_dual_camera(args):
                     fall_result = evaluate_fall(person, current_time, dual_cam_fall)
                     person['fall_result'] = fall_result
                     fall_state_store[store_key] = person['fall_state']  # 持久化
-                    gid = pid_to_global_a.get(person['pid'])
                     frame_a = draw_person_info(frame_a, person, fall_result, global_id=gid)
                 except Exception as e:
-                    print(f"Camera A 处理异常: {e}")
+                    logger.warning(f"Camera A 处理异常: {e}")
                     traceback.print_exc()
 
         # 跌倒判断 + 绘制（摄像头 B）
@@ -412,6 +464,14 @@ def run_dual_camera(args):
                     if store_key in fall_state_store:
                         person['fall_state'] = fall_state_store[store_key]
 
+                    gid = pid_to_global_b.get(person['pid'])
+
+                    if person.get('is_ghost'):
+                        if 'fall_result' not in person:
+                            person['fall_result'] = {'fall_detected': False, 'confidence': 0, 'state': 'Normal'}
+                        frame_b = draw_person_info(frame_b, person, person['fall_result'], global_id=gid)
+                        continue
+
                     dual_cam_fall = None
                     for a_idx, b_idx in matched_pairs:
                         if tracked_b[b_idx]['pid'] == person['pid']:
@@ -421,10 +481,9 @@ def run_dual_camera(args):
                     fall_result = evaluate_fall(person, current_time, dual_cam_fall)
                     person['fall_result'] = fall_result
                     fall_state_store[store_key] = person['fall_state']  # 持久化
-                    gid = pid_to_global_b.get(person['pid'])
                     frame_b = draw_person_info(frame_b, person, fall_result, global_id=gid)
                 except Exception as e:
-                    print(f"Camera B 处理异常: {e}")
+                    logger.warning(f"Camera B 处理异常: {e}")
                     traceback.print_exc()
 
         # 清理 fall_state_store 中消失的 PID（防止内存泄漏）
@@ -437,9 +496,34 @@ def run_dual_camera(args):
         for k in stale_keys:
             del fall_state_store[k]
 
-        # 跌倒警告横幅
-        fall_results_a = [p['fall_result'] for p in tracked_a if 'fall_result' in p]
-        fall_results_b = [p['fall_result'] for p in tracked_b if 'fall_result' in p]
+        # 清理 global_id_map 中长时间未出现的条目（防止内存泄漏）
+        active_pids = set()
+        for p in tracked_a:
+            active_pids.add(p['pid'])
+        for p in tracked_b:
+            active_pids.add(p['pid'])
+        stale_gid_keys = [k for k in global_id_map if k[0] not in active_pids and k[1] not in active_pids]
+        for k in stale_gid_keys:
+            gid = global_id_map[k]
+            del global_id_map[k]
+            # 清理反向索引中对应的条目
+            stale_ptg = [pid for pid, g in pid_to_global_store.items() if g == gid and pid not in active_pids]
+            for pid in stale_ptg:
+                del pid_to_global_store[pid]
+
+        # 跌倒警告横幅（传入 is_ghost 标记）
+        fall_results_a = []
+        for p in tracked_a:
+            if 'fall_result' in p:
+                fr = dict(p['fall_result'])
+                fr['is_ghost'] = p.get('is_ghost', False)
+                fall_results_a.append(fr)
+        fall_results_b = []
+        for p in tracked_b:
+            if 'fall_result' in p:
+                fr = dict(p['fall_result'])
+                fr['is_ghost'] = p.get('is_ghost', False)
+                fall_results_b.append(fr)
         if frame_a is not None:
             frame_a = draw_fall_alert(frame_a, fall_results_a)
         if frame_b is not None:
@@ -454,6 +538,15 @@ def run_dual_camera(args):
             fps_b = data_b.get('fps', 0)
             cv2.putText(frame_b, f"FPS: {fps_b:.0f}", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        # 时间戳水印
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        if frame_a is not None:
+            cv2.putText(frame_a, timestamp, (10, frame_a.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        if frame_b is not None:
+            cv2.putText(frame_b, timestamp, (10, frame_b.shape[0] - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         # 组合画面（支持单边或双边）
         if frame_a is not None and frame_b is not None:
@@ -481,7 +574,7 @@ def run_dual_camera(args):
         cv2.imshow("Dual Camera Fall Detection", combined)
 
         if cv2.waitKey(1) & 0xFF == 27:
-            print("ESC 退出")
+            logger.info("ESC 退出")
             stop_event.set()
             break
 
@@ -505,21 +598,31 @@ def main():
                         help='YOLOv8 姿态估计模型路径')
     parser.add_argument('--num_cams', type=int, default=1,
                         help='摄像头数量 (1 或 2)')
-    parser.add_argument('--cam_ids', type=int, nargs='+', default=[1],
-                        help='摄像头 ID 列表')
+    parser.add_argument('--cam_ids', type=int, nargs='+', default=[0],
+                        help='摄像头 ID 列表 (macOS Continuity Camera 用户可能需要 --cam_ids 1)')
     parser.add_argument('--video', type=str, nargs='+', default=None,
                         help='视频文件路径（替代摄像头）')
     parser.add_argument('--save_output', action='store_true',
                         help='保存输出视频')
+    parser.add_argument('--debug', action='store_true',
+                        help='启用调试日志（显示每帧检测细节）')
 
     args = parser.parse_args()
+
+    # 配置日志
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S'
+    )
 
     if args.num_cams == 1:
         run_single_camera(args)
     elif args.num_cams == 2:
         run_dual_camera(args)
     else:
-        print(f"不支持 {args.num_cams} 个摄像头，目前只支持 1 或 2")
+        logger.error(f"不支持 {args.num_cams} 个摄像头，目前只支持 1 或 2")
 
 
 if __name__ == "__main__":

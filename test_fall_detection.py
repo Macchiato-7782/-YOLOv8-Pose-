@@ -5,6 +5,8 @@
 
 import sys
 import time
+import pickle
+import pytest
 import numpy as np
 
 sys.path.insert(0, '.')
@@ -72,10 +74,7 @@ def make_person(pid, kp_5, aspect_ratio, angle_keypoints=None, history=None):
 
 
 def run_scenario(name, frames, expected_final_state, expected_fall_detected=None):
-    print(f"\n{'='*60}")
-    print(f"场景: {name}")
-    print(f"{'='*60}")
-
+    """运行场景并返回最终 fall_result"""
     current_time = time.time()
     person = None
     fall_result = None
@@ -99,264 +98,172 @@ def run_scenario(name, frames, expected_final_state, expected_fall_detected=None
         current_time += 0.05
         fall_result = evaluate_fall(person, current_time)
 
-        if i % 5 == 0 or i == len(frames) - 1:
-            state = fall_result['state']
-            det = fall_result['fall_detected']
-            print(f"  帧 {i:3d}: state={state:20s} fall_detected={det}")
-
-    actual_state = fall_result['state']
-    actual_detected = fall_result['fall_detected']
-    passed = True
-    if expected_final_state not in actual_state:
-        print(f"  FAIL: expected '{expected_final_state}' got '{actual_state}'")
-        passed = False
-    if expected_fall_detected is not None and actual_detected != expected_fall_detected:
-        print(f"  FAIL: expected fall_detected={expected_fall_detected} got {actual_detected}")
-        passed = False
-    if passed:
-        print(f"  PASS")
-    return passed
+    assert expected_final_state in fall_result['state'], \
+        f"expected '{expected_final_state}' got '{fall_result['state']}'"
+    if expected_fall_detected is not None:
+        assert fall_result['fall_detected'] == expected_fall_detected, \
+            f"expected fall_detected={expected_fall_detected} got {fall_result['fall_detected']}"
+    return fall_result
 
 
-def test_standing_still():
-    frames = []
-    for _ in range(30):
+# ============================================================
+# calculate_angle 测试
+# ============================================================
+
+class TestCalculateAngle:
+    def test_standing(self):
+        angle = calculate_angle((320, 160), (320, 300), (320, 420))
+        assert abs(angle - 180) < 5
+
+    def test_horizontal(self):
+        angle = calculate_angle((160, 300), (320, 300), (440, 300))
+        assert abs(angle - 180) < 5
+
+    def test_sitting(self):
+        angle = calculate_angle((320, 185), (320, 280), (400, 350))
+        assert 100 < angle < 160
+
+
+# ============================================================
+# 跌倒场景测试
+# ============================================================
+
+class TestFallScenarios:
+    def test_standing_still(self):
+        frames = []
+        for _ in range(30):
+            kp_5 = make_kp_5(100, 160, 300, 420)
+            frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
+        run_scenario("站立不动", frames, "Normal", False)
+
+    def test_sitting(self):
+        frames = []
+        for _ in range(30):
+            kp_5 = make_kp_5(130, 185, 280, 350)
+            frames.append((kp_5, 1.4, make_angle_keypoints(185, 280, 350)))
+        run_scenario("坐着不动", frames, "Normal", False)
+
+    def test_forward_fall(self):
+        frames = []
+        for i in range(15):
+            t = min(i / 10.0, 1.0)
+            kp_5 = make_kp_5(100 + t*200, 160 + t*140, 300 + t*50, 420)
+            ar = 2.5 * (1 - t) + 0.4 * t
+            ak = make_angle_keypoints(160 + t*140, 300 + t*50, 420)
+            frames.append((kp_5, ar, ak))
+        for _ in range(80):
+            kp_5 = make_kp_5(300, 300, 350, 420)
+            frames.append((kp_5, 0.4, make_angle_keypoints(300, 350, 420)))
+        run_scenario("前倒", frames, "FALL", True)
+
+    def test_side_fall(self):
+        frames = []
+        for i in range(15):
+            t = min(i / 10.0, 1.0)
+            kp_5 = make_kp_5(100 + t*250, 160 + t*140, 300 + t*50, 420)
+            ar = 2.5 * (1 - t) + 0.3 * t
+            ak = make_angle_keypoints(160 + t*140, 300 + t*50, 420)
+            frames.append((kp_5, ar, ak))
+        for _ in range(80):
+            kp_5 = make_kp_5(350, 350, 380, 420)
+            frames.append((kp_5, 0.3, make_angle_keypoints(350, 380, 420)))
+        run_scenario("侧倒", frames, "FALL", True)
+
+    def test_fast_fall(self):
+        frames = []
+        for _ in range(5):
+            kp_5 = make_kp_5(100, 160, 300, 420)
+            frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
+        for _ in range(5):
+            frames.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
+        for _ in range(80):
+            frames.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
+        run_scenario("快速摔倒", frames, "FALL", True)
+
+    def test_bend_and_recover(self):
+        frames = []
+        for _ in range(5):
+            kp_5 = make_kp_5(100, 160, 300, 420)
+            frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
+        for _ in range(10):
+            kp_5 = make_kp_5(250, 250, 300, 420)
+            frames.append((kp_5, 0.8, make_angle_keypoints(250, 300, 420)))
+        for _ in range(15):
+            kp_5 = make_kp_5(100, 160, 300, 420)
+            frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
+        run_scenario("弯腰后站起", frames, "Normal", False)
+
+    def test_already_lying(self):
+        frames = []
+        for _ in range(30):
+            frames.append((FALLEN_KP_5.copy(), 0.2, FALLEN_AK))
+        run_scenario("已躺在地上", frames, "Potential Fall")
+
+
+# ============================================================
+# 边界条件测试
+# ============================================================
+
+class TestEdgeCases:
+    def test_cross_process_serialization(self):
         kp_5 = make_kp_5(100, 160, 300, 420)
-        frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
-    return run_scenario("站立不动", frames, "Normal", False)
+        ak = make_angle_keypoints(160, 300, 420)
 
+        kp_5_p = pickle.loads(pickle.dumps(kp_5))
+        ak_p = pickle.loads(pickle.dumps(ak))
 
-def test_sitting():
-    frames = []
-    for _ in range(30):
-        kp_5 = make_kp_5(130, 185, 280, 350)
-        frames.append((kp_5, 1.4, make_angle_keypoints(185, 280, 350)))
-    return run_scenario("坐着不动", frames, "Normal", False)
+        for key in ['H', 'N', 'B', 'KL', 'KR']:
+            assert np.allclose(kp_5[key], kp_5_p[key]), f"kp_5['{key}'] corrupted after pickle"
+        for key in ['shoulder', 'hip', 'knee']:
+            assert ak[key] == ak_p[key], f"ak['{key}'] corrupted after pickle"
 
+        person = make_person(1, kp_5_p, 2.5, ak_p)
+        for _ in range(10):
+            person['history'].append(kp_5_p)
+        result = evaluate_fall(person, time.time())
+        assert result is not None and 'state' in result
 
-def test_forward_fall():
-    frames = []
-    for i in range(15):
-        t = min(i / 10.0, 1.0)
-        kp_5 = make_kp_5(100 + t*200, 160 + t*140, 300 + t*50, 420)
-        ar = 2.5 * (1 - t) + 0.4 * t
-        ak = make_angle_keypoints(160 + t*140, 300 + t*50, 420)
-        frames.append((kp_5, ar, ak))
-    for _ in range(30):
+    def test_angle_keypoints_fallback(self):
         kp_5 = make_kp_5(300, 300, 350, 420)
-        frames.append((kp_5, 0.4, make_angle_keypoints(300, 350, 420)))
-    return run_scenario("前倒", frames, "FALL", True)
+        person = make_person(1, kp_5, 0.4, angle_keypoints=None)
+        for _ in range(10):
+            person['history'].append(kp_5)
+        result = evaluate_fall(person, time.time())
+        assert result is not None and 'state' in result
 
+    def test_fall_state_persistence(self):
+        """模拟双摄模式：camera_process 每帧传来新 person，主进程用 fall_state_store 持久化"""
+        fall_state_store = {}
+        history_store = {}
 
-def test_side_fall():
-    frames = []
-    for i in range(15):
-        t = min(i / 10.0, 1.0)
-        kp_5 = make_kp_5(100 + t*250, 160 + t*140, 300 + t*50, 420)
-        ar = 2.5 * (1 - t) + 0.3 * t
-        ak = make_angle_keypoints(160 + t*140, 300 + t*50, 420)
-        frames.append((kp_5, ar, ak))
-    for _ in range(30):
-        kp_5 = make_kp_5(350, 350, 380, 420)
-        frames.append((kp_5, 0.3, make_angle_keypoints(350, 380, 420)))
-    return run_scenario("侧倒", frames, "FALL", True)
+        frames_data = []
+        for _ in range(5):
+            frames_data.append((make_kp_5(100, 160, 300, 420), 2.5, make_angle_keypoints(160, 300, 420)))
+        for i in range(15):
+            t = min(i / 10.0, 1.0)
+            frames_data.append((FALLEN_KP_5.copy(), 2.5 * (1-t) + 0.4 * t, FALLEN_AK))
+        for _ in range(80):
+            frames_data.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
 
+        current_time = time.time()
+        fall_result = None
 
-def test_fast_fall():
-    """快速摔倒：突然的姿态变化产生高 RE/GF，然后保持倒地"""
-    frames = []
-    for _ in range(5):
-        kp_5 = make_kp_5(100, 160, 300, 420)
-        frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
-    # 突然变为水平躺卧（产生高 RE = 角度变化率）
-    for _ in range(5):
-        frames.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
-    # 保持倒地足够长时间以满足持续时间要求
-    for _ in range(30):
-        frames.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
-    return run_scenario("快速摔倒", frames, "FALL", True)
+        for i, (kp_5, ar, ak) in enumerate(frames_data):
+            person = make_person(1, kp_5, ar, ak)
 
+            store_key = ('A', 1)
+            if store_key not in history_store:
+                history_store[store_key] = []
+            history_store[store_key].append(kp_5)
+            if len(history_store[store_key]) > 36:
+                history_store[store_key] = history_store[store_key][-36:]
+            person['history'] = list(history_store[store_key])
 
-def test_bend_and_recover():
-    frames = []
-    for _ in range(5):
-        kp_5 = make_kp_5(100, 160, 300, 420)
-        frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
-    for _ in range(10):
-        kp_5 = make_kp_5(250, 250, 300, 420)
-        frames.append((kp_5, 0.8, make_angle_keypoints(250, 300, 420)))
-    for _ in range(15):
-        kp_5 = make_kp_5(100, 160, 300, 420)
-        frames.append((kp_5, 2.5, make_angle_keypoints(160, 300, 420)))
-    return run_scenario("弯腰后站起", frames, "Normal", False)
+            if store_key in fall_state_store:
+                person['fall_state'] = fall_state_store[store_key]
 
+            current_time += 0.05
+            fall_result = evaluate_fall(person, current_time)
+            fall_state_store[store_key] = person['fall_state']
 
-def test_already_lying():
-    """已躺在地上：初始 AR 就低，物理特征检测（Path 2）"""
-    frames = []
-    for _ in range(30):
-        frames.append((FALLEN_KP_5.copy(), 0.2, FALLEN_AK))
-    # 期望至少是 Potential Fall（Path 2 物理检测或 Path 4）
-    return run_scenario("已躺在地上", frames, "Potential Fall")
-
-
-def test_cross_process_serialization():
-    import pickle
-    print(f"\n{'='*60}")
-    print(f"场景: 跨进程序列化 (pickle)")
-    print(f"{'='*60}")
-
-    kp_5 = make_kp_5(100, 160, 300, 420)
-    ak = make_angle_keypoints(160, 300, 420)
-
-    kp_5_p = pickle.loads(pickle.dumps(kp_5))
-    ak_p = pickle.loads(pickle.dumps(ak))
-
-    for key in ['H', 'N', 'B', 'KL', 'KR']:
-        if not np.allclose(kp_5[key], kp_5_p[key]):
-            print(f"  FAIL: kp_5['{key}'] corrupted after pickle")
-            return False
-    for key in ['shoulder', 'hip', 'knee']:
-        if ak[key] != ak_p[key]:
-            print(f"  FAIL: ak['{key}'] corrupted after pickle")
-            return False
-
-    person = make_person(1, kp_5_p, 2.5, ak_p)
-    for _ in range(10):
-        person['history'].append(kp_5_p)
-    result = evaluate_fall(person, time.time())
-    if result is None or 'state' not in result:
-        print(f"  FAIL: evaluate_fall failed with pickled data")
-        return False
-
-    print(f"  PASS: pickle round-trip OK, evaluate_fall works")
-    return True
-
-
-def test_angle_keypoints_fallback():
-    print(f"\n{'='*60}")
-    print(f"场景: angle_keypoints=None fallback")
-    print(f"{'='*60}")
-
-    kp_5 = make_kp_5(300, 300, 350, 420)
-    person = make_person(1, kp_5, 0.4, angle_keypoints=None)
-    for _ in range(10):
-        person['history'].append(kp_5)
-
-    result = evaluate_fall(person, time.time())
-    if result is None or 'state' not in result:
-        print(f"  FAIL: evaluate_fall crashed with angle_keypoints=None")
-        return False
-
-    print(f"  PASS: angle_keypoints=None works, state={result['state']}")
-    return True
-
-
-def test_calculate_angle():
-    print(f"\n{'='*60}")
-    print(f"场景: calculate_angle 验证")
-    print(f"{'='*60}")
-
-    angle_standing = calculate_angle((320, 160), (320, 300), (320, 420))
-    angle_fallen = calculate_angle((160, 300), (320, 300), (440, 300))
-    angle_sitting = calculate_angle((320, 185), (320, 280), (400, 350))
-
-    print(f"  站立: {angle_standing:.1f} (expect ~180)")
-    print(f"  水平: {angle_fallen:.1f} (expect ~180)")
-    print(f"  坐姿: {angle_sitting:.1f}")
-
-    passed = True
-    if abs(angle_standing - 180) > 5:
-        print(f"  FAIL: standing angle off")
-        passed = False
-    if abs(angle_fallen - 180) > 5:
-        print(f"  FAIL: horizontal angle off")
-        passed = False
-    if passed:
-        print(f"  PASS")
-    return passed
-
-
-def test_fall_state_persistence():
-    """模拟双摄模式：camera_process 每帧传来新 person，主进程用 fall_state_store 持久化"""
-    print(f"\n{'='*60}")
-    print(f"场景: fall_state 跨帧持久化")
-    print(f"{'='*60}")
-
-    fall_state_store = {}
-    history_store = {}
-
-    frames_data = []
-    for _ in range(5):
-        frames_data.append((make_kp_5(100, 160, 300, 420), 2.5, make_angle_keypoints(160, 300, 420)))
-    for i in range(15):
-        t = min(i / 10.0, 1.0)
-        frames_data.append((FALLEN_KP_5.copy(), 2.5 * (1-t) + 0.4 * t, FALLEN_AK))
-    for _ in range(20):
-        frames_data.append((FALLEN_KP_5.copy(), 0.4, FALLEN_AK))
-
-    current_time = time.time()
-    fall_result = None
-
-    for i, (kp_5, ar, ak) in enumerate(frames_data):
-        person = make_person(1, kp_5, ar, ak)
-
-        store_key = ('A', 1)
-        if store_key not in history_store:
-            history_store[store_key] = []
-        history_store[store_key].append(kp_5)
-        if len(history_store[store_key]) > 36:
-            history_store[store_key] = history_store[store_key][-36:]
-        person['history'] = list(history_store[store_key])
-
-        if store_key in fall_state_store:
-            person['fall_state'] = fall_state_store[store_key]
-
-        current_time += 0.05
-        fall_result = evaluate_fall(person, current_time)
-        fall_state_store[store_key] = person['fall_state']
-
-        if i % 5 == 0 or i == len(frames_data) - 1:
-            state = fall_result['state']
-            det = fall_result['fall_detected']
-            hist_len = len(person['fall_state'].get('trigger_history', []))
-            print(f"  帧 {i:3d}: state={state:20s} fall_detected={det} trigger_history_len={hist_len}")
-
-    if fall_result and fall_result['fall_detected']:
-        print(f"  PASS: fall_state persistence works, fall detected")
-        return True
-    else:
-        print(f"  FAIL: fall not detected (state={fall_result['state']})")
-        return False
-
-
-if __name__ == '__main__':
-    results = []
-    results.append(("calculate_angle", test_calculate_angle()))
-    results.append(("pickle序列化", test_cross_process_serialization()))
-    results.append(("angle fallback", test_angle_keypoints_fallback()))
-    results.append(("站立不动", test_standing_still()))
-    results.append(("坐着", test_sitting()))
-    results.append(("前倒", test_forward_fall()))
-    results.append(("侧倒", test_side_fall()))
-    results.append(("快速摔倒", test_fast_fall()))
-    results.append(("弯腰站起", test_bend_and_recover()))
-    results.append(("已躺地上", test_already_lying()))
-    results.append(("fall_state持久化", test_fall_state_persistence()))
-
-    print(f"\n{'='*60}")
-    print("测试结果汇总")
-    print(f"{'='*60}")
-    all_passed = True
-    for name, passed in results:
-        status = "PASS" if passed else "FAIL"
-        print(f"  {status}  {name}")
-        if not passed:
-            all_passed = False
-
-    print(f"\n{'='*60}")
-    if all_passed:
-        print("ALL TESTS PASSED")
-    else:
-        print("SOME TESTS FAILED")
-    print(f"{'='*60}")
+        assert fall_result['fall_detected'], f"fall not detected (state={fall_result['state']})"

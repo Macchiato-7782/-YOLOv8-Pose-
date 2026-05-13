@@ -5,25 +5,25 @@
 
 import cv2
 import time
+import logging
 import torch
 import numpy as np
 from ultralytics import YOLO
 from tracking import SingleCameraTracker
 from cross_camera import get_color_histogram
+from config import CAM_PROC as _CFG
 
-# YOLO 关键点索引（用于髋部角度计算）
-ANGLE_KPTS_INDICES = {
-    'shoulder': 5,
-    'hip': 11,
-    'knee': 13
-}
-MIN_CONF_FOR_ANGLE_KPTS = 0.2
-ROI_ENABLED = True       # ROI 二次推理开关
-ROI_CONF = 0.35         # ROI 二次推理置信度（比主推理低，但比 0.2 高）
-ROI_EXPAND_RATIO = 0.25 # ROI 向外扩展比例
-ROI_MATCH_IOU = 0.3     # ROI 检测结果必须与已有目标 IoU > 此值才保留（过滤假检）
-ROI_MAX_TIME = 0.1      # ROI 推理最大耗时（秒），超时跳过
-IOU_DEDUP_THRESHOLD = 0.9  # 去重 IoU 阈值
+logger = logging.getLogger(__name__)
+
+# 从配置文件读取参数
+ANGLE_KPTS_INDICES = _CFG.get('angle_kpts_indices', {'shoulder': 5, 'hip': 11, 'knee': 13})
+MIN_CONF_FOR_ANGLE_KPTS = _CFG.get('min_conf_for_angle_kpts', 0.2)
+ROI_ENABLED = _CFG.get('roi_enabled', True)
+ROI_CONF = _CFG.get('roi_conf', 0.35)
+ROI_EXPAND_RATIO = _CFG.get('roi_expand_ratio', 0.25)
+ROI_MATCH_IOU = _CFG.get('roi_match_iou', 0.3)
+ROI_MAX_TIME = _CFG.get('roi_max_time', 0.1)
+IOU_DEDUP_THRESHOLD = _CFG.get('iou_dedup_threshold', 0.9)
 
 
 def compute_iou(b1, b2):
@@ -35,6 +35,92 @@ def compute_iou(b1, b2):
     area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
     union = area1 + area2 - inter
     return inter / union if union > 0 else 0
+
+
+def merge_detections(all_detections):
+    """合并去重：IoU > 阈值的重复检测只保留一个"""
+    merged = []
+    for det in all_detections:
+        dup = False
+        for m in merged:
+            if compute_iou(det['bbox'], m['bbox']) > IOU_DEDUP_THRESHOLD:
+                dup = True
+                break
+        if not dup:
+            merged.append(det)
+    return merged
+
+
+def run_roi_inference(model, frame, rois, tracker):
+    """
+    ROI 二次推理：仅在检测到潜在跌倒时，在预测位置附近小范围用低置信度重推理
+
+    model: YOLO 模型
+    frame: 当前帧
+    rois: [{'bbox': (x1,y1,x2,y2), 'pid': int, 'predicted_center': (cx,cy)}, ...]
+    tracker: SingleCameraTracker 实例（用于 extract_detections）
+
+    返回: list of detection dicts
+    """
+    if not ROI_ENABLED or not rois:
+        return []
+
+    roi_detections = []
+    roi_start = time.time()
+    try:
+        frame_h, frame_w = frame.shape[:2]
+        for roi in rois:
+            if time.time() - roi_start > ROI_MAX_TIME:
+                break
+            roi_bbox = roi['bbox']
+            rx1, ry1, rx2, ry2 = roi_bbox
+            w, h = rx2 - rx1, ry2 - ry1
+
+            # 用预测位置做 ROI 中心（如果没有预测位置就用 bbox 中心）
+            pred = roi.get('predicted_center')
+            if pred is not None:
+                pcx, pcy = pred
+            else:
+                pcx, pcy = (rx1 + rx2) / 2, (ry1 + ry2) / 2
+
+            # 以预测位置为中心，bbox 尺寸为基础，小范围扩展
+            half_w = w * (0.5 + ROI_EXPAND_RATIO)
+            half_h = h * (0.5 + ROI_EXPAND_RATIO)
+            ex1 = max(0, int(pcx - half_w))
+            ey1 = max(0, int(pcy - half_h))
+            ex2 = min(frame_w, int(pcx + half_w))
+            ey2 = min(frame_h, int(pcy + half_h))
+
+            crop = frame[ey1:ey2, ex1:ex2]
+            if crop.size == 0:
+                continue
+            crop_results = model(crop, conf=ROI_CONF, verbose=False)[0]
+
+            # 映射回全图坐标
+            if crop_results.boxes is not None and len(crop_results.boxes) > 0:
+                data = crop_results.boxes.data.clone()
+                data[:, 0] += ex1
+                data[:, 1] += ey1
+                data[:, 2] += ex1
+                data[:, 3] += ey1
+                crop_results.boxes.data = data
+            if crop_results.keypoints is not None:
+                for kp in crop_results.keypoints:
+                    if kp.xy is not None:
+                        kp.data = kp.data.clone()
+                        kp.data[..., 0] += ex1
+                        kp.data[..., 1] += ey1
+
+            # 只保留与 ROI 源 bbox 重叠的检测
+            roi_dets = tracker.extract_detections(crop_results)
+            for det in roi_dets:
+                if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
+                    roi_detections.append(det)
+    except Exception as e:
+        logger.warning(f"ROI 推理异常: {e}")
+        roi_detections = []
+
+    return roi_detections
 
 
 def extract_angle_keypoints(keypoints, confs):
@@ -65,7 +151,15 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
             cap = cv2.VideoCapture(int(camera_id))
 
         if not cap.isOpened():
-            print(f"[Camera {camera_id}] 无法打开摄像头/视频")
+            logger.error(f"[Camera {camera_id}] 无法打开摄像头/视频")
+            queue.put(None)
+            return
+
+        # 验证摄像头能实际读取帧
+        ret, _ = cap.read()
+        if not ret:
+            logger.error(f"[Camera {camera_id}] 能打开但无法读取帧")
+            cap.release()
             queue.put(None)
             return
 
@@ -90,80 +184,31 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
                     if ret:
                         break
             if not ret:
-                print(f"[Camera {camera_id}] 视频结束或无法读取帧")
+                logger.error(f"[Camera {camera_id}] 视频结束或无法读取帧")
                 break
 
             frame_count += 1
             current_time = time.time()
             fps = frame_count / (current_time - t0 + 1e-8)
 
-            # YOLO 推理（降低阈值以检测躺卧姿态）
-            results = model(frame, conf=0.3, verbose=False)[0]
+            try:
+                # ByteTracker 跟踪推理
+                results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
 
-            # 提取主推理检测结果
-            main_detections = tracker.extract_detections(results)
+                # 提取跟踪结果
+                main_detections = tracker.extract_detections(results)
+                tracked = tracker.update(main_detections, current_time)
 
-            # ROI 二次推理：每 3 帧推理一次（降低开销）
-            roi_detections = []
-            roi_start = time.time()
-            if ROI_ENABLED and low_conf_rois and frame_count % 3 == 0:
-                try:
-                    frame_h, frame_w = frame.shape[:2]
-                    for roi in low_conf_rois:
-                        if time.time() - roi_start > ROI_MAX_TIME:
-                            break  # ROI 超时，跳过剩余
-                        roi_bbox = roi['bbox']
-                        rx1, ry1, rx2, ry2 = roi_bbox
-                        w, h = rx2 - rx1, ry2 - ry1
-                        ex1 = max(0, int(rx1 - w * ROI_EXPAND_RATIO))
-                        ey1 = max(0, int(ry1 - h * ROI_EXPAND_RATIO))
-                        ex2 = min(frame_w, int(rx2 + w * ROI_EXPAND_RATIO))
-                        ey2 = min(frame_h, int(ry2 + h * ROI_EXPAND_RATIO))
+                # ROI 二次推理：每 N 帧推理一次，关联到已有 track
+                roi_interval = _CFG.get('roi_interval', 3)
+                if frame_count % roi_interval == 0 and low_conf_rois:
+                    roi_detections = run_roi_inference(model, frame, low_conf_rois, tracker)
+                    tracker.update_roi(roi_detections, current_time)
 
-                        crop = frame[ey1:ey2, ex1:ex2]
-                        if crop.size == 0:
-                            continue
-                        crop_results = model(crop, conf=ROI_CONF, verbose=False)[0]
-
-                        # 映射回全图坐标
-                        if crop_results.boxes is not None and len(crop_results.boxes) > 0:
-                            data = crop_results.boxes.data.clone()
-                            data[:, 0] += ex1
-                            data[:, 1] += ey1
-                            data[:, 2] += ex1
-                            data[:, 3] += ey1
-                            crop_results.boxes.data = data
-                        if crop_results.keypoints is not None:
-                            for kp in crop_results.keypoints:
-                                if kp.xy is not None:
-                                    kp.data = kp.data.clone()
-                                    kp.data[..., 0] += ex1
-                                    kp.data[..., 1] += ey1
-
-                        # 只保留与 ROI 源 bbox 重叠的检测
-                        roi_dets = tracker.extract_detections(crop_results)
-                        for det in roi_dets:
-                            if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
-                                roi_detections.append(det)
-                except Exception as e:
-                    print(f"[Camera {camera_id}] ROI 推理异常: {e}")
-                    roi_detections = []
-
-            # 合并去重：IoU > 0.9 保留高分那个
-            all_detections = main_detections + roi_detections
-            merged = []
-            for det in all_detections:
-                dup = False
-                for i, m in enumerate(merged):
-                    if compute_iou(det['bbox'], m['bbox']) > IOU_DEDUP_THRESHOLD:
-                        dup = True
-                        break
-                if not dup:
-                    merged.append(det)
-
-            # 跟踪更新（用合并后的 detections）
-            tracked = tracker.update(merged, current_time)
-            tracker.cleanup(current_time)
+                tracker.cleanup(current_time)
+            except Exception as e:
+                logger.warning(f"[Camera {camera_id}] 检测/跟踪异常: {e}")
+                continue
 
             # 为每个跟踪目标计算直方图和角度关键点
             for person in tracked:
@@ -178,20 +223,26 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
                 else:
                     person['angle_keypoints'] = None
 
-            # 更新 ROI 二次推理区域
+            # 更新 ROI 二次推理区域（AR < 1.5 可能是躺卧，用预测位置做 ROI 中心）
             low_conf_rois = []
             for person in tracked:
-                # 用宽高比判断是否需要 ROI 二次推理（AR < 1.5 可能是躺卧）
                 ar = person.get('aspect_ratio')
                 if ar is not None and ar < 1.5:
-                    low_conf_rois.append({'bbox': person['bbox'], 'pid': person['pid']})
+                    pid = person['pid']
+                    predicted = tracker._predict_position(tracker.person_history.get(pid, {}))
+                    low_conf_rois.append({
+                        'bbox': person['bbox'],
+                        'pid': pid,
+                        'predicted_center': predicted,
+                    })
 
             # 传递给主进程（非阻塞，丢帧也不卡死）
+            import queue as _queue
             try:
                 while queue.full():
                     try:
                         queue.get_nowait()
-                    except Exception:
+                    except _queue.Empty:
                         break
                 queue.put({
                     'camera_id': camera_id,
@@ -201,12 +252,12 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
                     'fps': fps,
                     'timestamp': current_time,
                 }, timeout=0.5)
-            except Exception:
+            except (_queue.Full, TimeoutError):
                 pass  # 队列满就丢帧
 
         cap.release()
         queue.put(None)
 
     except Exception as e:
-        print(f"[Camera {camera_id}] 进程异常: {e}")
+        logger.error(f"[Camera {camera_id}] 进程异常: {e}")
         queue.put(None)
