@@ -11,13 +11,11 @@
 """
 
 import numpy as np
+from config import FEATURES as _CFG
 
-FEATURE_LIST = ["ratio_bbox", "log_angle", "re", "ratio_derivative", "gf", "head_descent"]
-FRAME_FEATURES = 2  # ratio_bbox 和 log_angle 只需要当前帧
-
-# 头部下降趋势参数
-HEAD_DESCENT_WINDOW = 20   # 检查最近 N 帧（约 1 秒 @20fps）
-HEAD_DESCENT_MIN_PIXELS = 15  # 至少下降 15px 才算（过滤关键点抖动）
+# 从配置文件读取参数
+HEAD_DESCENT_WINDOW = _CFG.get('head_descent_window', 20)
+HEAD_DESCENT_MIN_PIXELS = _CFG.get('head_descent_min_pixels', 15)
 
 
 def yolo_to_5keypoints(keypoints, confs):
@@ -83,10 +81,32 @@ def get_angle_vertical(body_vector):
     return np.arccos(cos_angle)
 
 
-def get_rot_energy(prev_kp, curr_kp):
+def get_torso_inclination(kp_5):
+    """
+    躯干倾斜角：髋→肩向量与垂直轴的夹角（度）
+
+    站立时约0°，前倾/后倾增大，跌倒时>50°
+    比三点角度更能反映"人是否倒了"
+    """
+    hip = np.array(kp_5['B'])
+    shoulder = np.array(kp_5['N'])
+    torso_vec = shoulder - hip  # 髋→肩
+
+    if np.linalg.norm(torso_vec) < 1e-6:
+        return 0.0
+
+    vertical = np.array([0, -1])  # 垂直向上（y轴向下）
+    cos_angle = np.dot(torso_vec, vertical) / (np.linalg.norm(torso_vec) * np.linalg.norm(vertical) + 1e-8)
+    cos_angle = np.clip(cos_angle, -1, 1)
+    return np.degrees(np.arccos(cos_angle))
+
+
+def get_rot_energy(prev_kp, curr_kp, dt=None):
     """
     旋转能量：基于倒立摆模型
     计算躯干向量（N→B）在两帧之间的角度变化率
+
+    dt: 帧间时间（秒）。传入后归一化为每秒角速度，不传则返回每帧值（兼容旧逻辑）
     """
     prev_body = prev_kp['N'] - prev_kp['B']
     curr_body = curr_kp['N'] - curr_kp['B']
@@ -101,7 +121,10 @@ def get_rot_energy(prev_kp, curr_kp):
     elif d_angle < -np.pi:
         d_angle += 2 * np.pi
 
-    return abs(d_angle)
+    raw = abs(d_angle)
+    if dt is not None and dt > 0:
+        return raw / dt  # 归一化为 rad/s
+    return raw
 
 
 def get_ratio_derivative(prev_kp, curr_kp):
@@ -111,10 +134,12 @@ def get_ratio_derivative(prev_kp, curr_kp):
     return curr_ratio - prev_ratio
 
 
-def get_gf(kp_t2, kp_t1, kp_t0):
+def get_gf(kp_t2, kp_t1, kp_t0, dt=None):
     """
     重力因子：连续 3 帧重心加速度方向与重力方向的一致性
     kp_t2 最早, kp_t1 中间, kp_t0 最新
+
+    dt: 帧间时间（秒）。传入后归一化为每秒²加速度，不传则返回原始二阶差分（兼容旧逻辑）
     """
     def center_of_gravity(kp):
         """估算重心位置"""
@@ -124,15 +149,16 @@ def get_gf(kp_t2, kp_t1, kp_t0):
     p1 = center_of_gravity(kp_t1)
     p0 = center_of_gravity(kp_t0)
 
-    # 二阶差分 = 加速度
+    # 二阶差分 = 加速度（原始值）
     accel = p0 - 2 * p1 + p2
 
     # 重力方向（向下为正）
     gravity = np.array([0, 1])
 
-    # 用原始投影值，不归一化（避免小噪声被放大到 ±1.0）
-    # 站立静止时噪声约 ±10，真实摔倒时远大于此
-    return float(np.dot(accel, gravity))
+    raw = float(np.dot(accel, gravity))
+    if dt is not None and dt > 0:
+        return raw / (dt * dt)  # 归一化为 pixel/s²
+    return raw
 
 
 def get_head_descent(history, curr_kp, window=HEAD_DESCENT_WINDOW, initial_body_height=None):
@@ -149,7 +175,9 @@ def get_head_descent(history, curr_kp, window=HEAD_DESCENT_WINDOW, initial_body_
     prev_kp = history[-2]
     if prev_kp is not None and prev_kp['H'][1] > 0:
         single_frame_jump = abs(curr_kp['H'][1] - prev_kp['H'][1])
-        if single_frame_jump > 30:  # 单帧跳变 > 30px，判定为噪声
+        # 噪声阈值按身体高度比例计算（约10%身高），最低30px
+        noise_threshold = max(30, 0.1 * initial_body_height) if initial_body_height and initial_body_height > 10 else 30
+        if single_frame_jump > noise_threshold:
             return 0
 
     # 取窗口内的历史帧
@@ -168,16 +196,17 @@ def get_head_descent(history, curr_kp, window=HEAD_DESCENT_WINDOW, initial_body_
     # 头部 y 坐标变化（y 轴向下为正，所以下降是正值）
     head_drop = curr_kp['H'][1] - first_kp['H'][1]
 
-    # 过滤微小抖动
-    if head_drop < HEAD_DESCENT_MIN_PIXELS:
-        return 0
-
     # 归一化：优先用初始站立时的 body_height（稳定），否则用当前帧
     if initial_body_height is not None and initial_body_height > 10:
         body_height = initial_body_height
     else:
         body_height = (curr_kp['KL'][1] + curr_kp['KR'][1]) / 2 - curr_kp['H'][1]
     if body_height < 10:
+        return 0
+
+    # 过滤微小抖动（按身体高度比例，约2%身高，最低HEAD_DESCENT_MIN_PIXELS）
+    min_drop = max(HEAD_DESCENT_MIN_PIXELS, 0.02 * body_height)
+    if head_drop < min_drop:
         return 0
 
     return max(0, head_drop / body_height)
@@ -190,42 +219,35 @@ def compute_all_features(person_data):
     person_data: dict 包含:
         - 'kp_5': 当前帧的 5 关键点
         - 'history': 最近 N 帧的 5 关键点历史列表
+        - 'dt': 帧间时间（秒，可选，用于帧率归一化）
 
     返回: dict 特征值，或 None 如果数据不足
     """
     history = person_data.get('history', [])
     curr_kp = person_data.get('kp_5')
+    dt = person_data.get('dt')  # 帧间时间（秒）
 
     if curr_kp is None:
         return None
 
     features = {}
 
-    # 当前帧特征
-    body_vector = curr_kp['N'] - curr_kp['B']
-    features['ratio_bbox'] = get_ratio_bbox(curr_kp)
-    features['angle_vertical'] = get_angle_vertical(body_vector)
-    features['log_angle'] = np.log(1 + abs(features['angle_vertical']))
-
     # 需要前 1 帧的特征
     if len(history) >= 2:
         prev_kp = history[-2]
         if prev_kp is not None:
-            features['re'] = get_rot_energy(prev_kp, curr_kp)
-            features['ratio_derivative'] = get_ratio_derivative(prev_kp, curr_kp)
+            features['re'] = get_rot_energy(prev_kp, curr_kp, dt=dt)
 
             # 需要前 2 帧的特征
             if len(history) >= 3 and history[-3] is not None:
-                features['gf'] = get_gf(history[-3], prev_kp, curr_kp)
+                features['gf'] = get_gf(history[-3], prev_kp, curr_kp, dt=dt)
             else:
                 features['gf'] = 0
         else:
             features['re'] = 0
-            features['ratio_derivative'] = 0
             features['gf'] = 0
     else:
         features['re'] = 0
-        features['ratio_derivative'] = 0
         features['gf'] = 0
 
     # 头部下降趋势（捕捉慢速滑倒）

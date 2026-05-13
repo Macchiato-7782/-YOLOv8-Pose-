@@ -1,0 +1,97 @@
+# 实时跌倒检测系统配置文件
+# 所有参数均可在此文件中调整，无需修改源代码
+
+fall_logic:
+  # 规则阈值
+  horizontal_ar_threshold: 0.6    # 宽高比阈值（低于此值认为水平）
+  angle_threshold: 120            # 髋部角度阈值（度），站立约180°，跌倒时<120°
+  torso_inclination_threshold: 55 # 躯干倾斜角阈值（度），站立~0°，弯腰30-60°，跌倒>70°
+  min_fall_pose_duration: 3.5     # 必须持续多少秒才确认跌倒（给弯腰恢复留足够时间）
+
+  # 物理特征阈值（帧率归一化后的每秒值）
+  re_threshold: 8                 # 旋转能量 rad/s（过滤弯腰等小动作尖峰）
+  gf_threshold: 8000              # 重力因子 pixel/s²（过滤小动作尖峰）
+  head_descent_threshold: 0.2     # 头部下降阈值（身高的20%）
+
+  # 高置信度快速通道阈值（四个条件同时满足时跳过持续时间要求）
+  fast_re_threshold: 15
+  fast_gf_threshold: 15000
+  fast_angle_threshold: 120
+
+  # 反弹检测（弯腰后站起 vs 真正摔倒）
+  rebound_threshold: 0.15         # 头部回弹阈值（身高的15%，更容易检测到弯腰恢复）
+  rebound_frames: 2               # 需要连续多少帧回弹才判定
+
+  # 恢复检测（已确认跌倒后站起来）
+  recovery_frames: 3              # 需要连续多少帧AR恢复才重置状态
+
+  # EMA 平滑系数（物理特征降噪）
+  ema_alpha: 0.3                  # 0=完全平滑，1=不平滑
+
+  # 滑动时间窗口（更保守，减少误报）
+  window_size: 20                 # 窗口大小（帧数），HumanFallDetection用36
+  window_trigger_ratio: 0.5       # 窗口内50%帧触发才确认（20帧中10帧）
+  min_consecutive_triggers: 5     # 连续触发帧数要求（过滤弯腰等瞬间动作）
+
+  # Savitzky-Golay 滤波（物理特征二次平滑）
+  sg_window: 7                    # SG滤波窗口（必须为奇数）
+  sg_polyorder: 2                 # SG滤波多项式阶数
+
+  # 初始站立检测
+  min_standing_ar: 1.0            # AR必须大于此值才开始跌倒检测
+
+  # 小目标面积阈值
+  min_bbox_area: 3000             # 低于此值的bbox宽高比不可靠
+
+  # 双摄确认
+  dual_cam_confirm: true
+  single_cam_fall_confidence: 0.6
+  dual_cam_fall_confidence: 0.95
+
+features:
+  # 头部下降趋势参数
+  head_descent_window: 20         # 检查最近N帧（约1秒@20fps）
+  head_descent_min_pixels: 15     # 至少下降多少px才算（过滤关键点抖动）
+
+tracking:
+  # 全身检测要求
+  required_kpts_for_full_body: [0, 5, 6, 11, 12, 15, 16]
+  min_kpts_for_full_body: 4
+  min_conf_kpt: 0.2
+
+  # 幽灵目标机制
+  ghost_timeout: 3.0              # 普通目标幽灵超时（秒）
+  ghost_timeout_fallen: 5.0       # 已确认跌倒目标幽灵超时（秒）
+  ghost_distance_multiplier: 1.5  # 幽灵目标匹配距离倍数
+
+  # 跟踪器参数
+  distance_threshold: 150         # 质心匹配最大像素距离
+  cleanup_interval: 5             # 清理间隔（秒）
+  history_length: 36              # 关键点历史缓冲大小
+
+cross_camera:
+  # 直方图匹配阈值
+  hist_threshold: 0.5             # >此值认为是同一人
+  hist_mismatch_threshold: 0.2    # <此值拆开已匹配对
+
+  # 直方图参数
+  hist_nbins: 8                   # HSV直方图bin数（H通道，S通道=2倍）
+
+camera_process:
+  # 角度关键点
+  angle_kpts_indices:
+    shoulder: 5
+    hip: 11
+    knee: 13
+  min_conf_for_angle_kpts: 0.2
+
+  # ROI 二次推理（仅在潜在跌倒时触发，小范围低置信度重推理）
+  roi_enabled: true
+  roi_conf: 0.25                  # ROI推理置信度（低于主推理，捕捉躺卧姿态）
+  roi_expand_ratio: 0.15          # ROI向外扩展比例（小范围，减少误检）
+  roi_match_iou: 0.3              # ROI检测结果最小IoU
+  roi_max_time: 0.1               # ROI推理最大耗时（秒）
+  roi_interval: 3                 # 每隔几帧做一次ROI推理
+
+  # 去重
+  iou_dedup_threshold: 0.9        # 去重IoU阈值

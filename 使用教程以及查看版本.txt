@@ -1,0 +1,79 @@
+运行方式
+打开终端，执行：
+cd ~/Desktop/学习资料/Real-Time-Fall-Detection
+source venv/bin/activate
+
+# 单摄像头
+python main.py
+
+# 单视频文件
+python main.py --video your_video.mp4
+跑全部视频逐个测试：
+
+for f in 视频素材/*.mp4; do echo "=== $f ===" && python main.py --video "$f" --save_output; done
+
+# 双摄像头
+python main.py --num_cams 2 --cam_ids 0 1
+
+# 双视频文件
+python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
+
+# 保存输出视频
+python main.py --num_cams 2 --cam_ids 0 1 --save_output
+
+# 运行模拟测试（不需要摄像头）
+python test_fall_detection.py
+
+按 ESC 退出。
+# 1. 先看历史版本列表
+git log --oneline
+输出类似：
+
+
+7a8e86d README: 添加更新日志
+cca4a9f 更新文档: 部署教程、README、使用教程
+b443c91 修复: 跌倒检测核心逻辑全面修复 + 模拟测试
+ede5803 紧急修复: 跌倒时卡死退出 + 3个逻辑bug
+3a5af3f 修复: 降低检测阈值+ROI超时保护+异常处理
+ff3c3e6 初始化: YOLOv8-Pose 实时跌倒检测项目
+
+# 2. 退回到某个版本（比如 b443c91）
+git checkout b443c91
+
+# 这时候代码变成那个版本的状态，但只是"看看"，不影响任何东西
+# 想回来：git checkout main
+
+# 3. 如果确定要永久退回（撤销之后的所有提交）
+git reset --hard b443c91
+git push origin main --force
+
+# 4. 只撤销某一次提交（保留其他改动）
+git revert ede5803
+git push origin main
+简单记法：
+
+想做什么	命令
+看看旧版本	git checkout 旧版本号
+回来看最新	git checkout main
+永久退回	git reset --hard 旧版本号
+只撤销某次	git revert 版本号
+建议用 checkout 先看看，确认没问题再决定要不要 reset。
+
+
+==================== 手动保存版本 ====================
+
+每次改完代码想保存，执行以下三步：
+
+# 1. 查看改了哪些文件
+git status
+
+# 2. 添加修改到暂存区
+git add .                       # 添加所有修改
+# 或者只添加指定文件：
+git add main.py fall_logic.py
+
+# 3. 提交保存，引号里写本次修改的说明
+git commit -m "你的修改说明"
+
+# 之后查看保存记录
+git log --oneline
