@@ -88,8 +88,8 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（174 个用例）
-python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py test_runtime_integrity.py -v
+# 运行全部测试（193 个用例）
+python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py test_runtime_integrity.py test_runtime_engine.py -v
 
 # 只运行跌倒场景测试
 python -m pytest test_fall_detection.py -v
@@ -104,7 +104,7 @@ python -m pytest test_backends.py -v
 python -m pytest test_runtime_integrity.py -v
 ```
 
-覆盖 8 个测试模块、174 个用例。
+覆盖 9 个测试模块、193 个用例。
 
 ## 跌倒判断逻辑
 
@@ -385,12 +385,27 @@ ONNX vs Ultralytics:
 │       ├── runtime.py          # EventRuntime 事件生成+去重
 │       ├── serializers.py      # dataclass → JSON-friendly
 │       └── validators.py       # 结构校验
+│   └── engine/                 # Runtime Engine
+│       ├── __init__.py
+│       ├── runtime_engine.py   # RuntimeEngine 入口
+│       ├── runtime_session.py  # RuntimeSession 状态管理
+│       ├── camera_session.py   # CameraSession 生命周期
+│       ├── frame_buffer.py     # SharedFrameBuffer
+│       ├── scheduler.py        # RuntimeScheduler
+│       ├── worker.py           # RuntimeWorker
+│       ├── event_bus.py        # EventBus 事件总线
+│       ├── signals.py          # RuntimeSignals
+│       ├── lifecycle.py        # LifecycleManager
+│       ├── registry.py         # RuntimeRegistry
+│       ├── health.py           # HealthMonitor
+│       └── metrics.py          # RuntimeMetrics
 ├── tools/                      # 开发工具
 │   ├── export_onnx.py          # PT → ONNX 导出
 │   ├── benchmark_backend.py    # 后端性能对比
 │   └── check_runtime_purity.py # Runtime 纯度检查
 ├── docs/                       # 文档
-│   └── runtime_architecture.md # Runtime Flow 架构
+│   ├── runtime_architecture.md # Runtime Flow 架构
+│   └── runtime_engine.md       # Runtime Engine 架构
 ├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
 ├── features.py                 # 物理特征计算（旋转能量、重力因子、头部下降）
 ├── tracking.py                 # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
@@ -406,6 +421,7 @@ ONNX vs Ultralytics:
 ├── test_backends.py            # 推理后端测试
 ├── test_runtime_pipeline.py    # Runtime Pipeline 测试
 ├── test_runtime_integrity.py   # Runtime 完整性测试
+├── test_runtime_engine.py      # Runtime Engine 测试
 ├── requirements.txt            # 依赖清单
 └── README.md
 ```
@@ -481,6 +497,24 @@ ONNX vs Ultralytics:
 - 新增 `tools/check_runtime_purity.py`：自动扫描 Runtime dict leak
 - 新增 `test_runtime_integrity.py`：数据类型完整性测试
 - 测试覆盖增至 **174 个**，全部通过
+
+**Runtime Engine Architecture（v3.4）:**
+- 新增 `fall_detection/engine/` Runtime Engine 模块
+- 实现 `RuntimeEngine`：工业级边缘 AI Runtime 入口
+- 实现 `RuntimeSession`：统一 Runtime 状态管理（tracking/frame/backend/scheduler/metrics）
+- 实现 `CameraSession`：统一摄像头生命周期（connect/disconnect/reconnect）
+- 实现 `SharedFrameBuffer`：共享帧缓冲区（ring buffer + ref counting）
+- 实现 `EventBus`：统一事件总线（subscribe/unsubscribe/publish）
+- 实现 `RuntimeScheduler`：任务调度器，支持不同 pipeline 不同频率
+- 实现 `RuntimeWorker`：Worker 系统（queue-based, graceful shutdown, exception isolation）
+- 实现 `RuntimeLifecycleManager`：统一 start/stop/pause/resume/restart
+- 实现 `RuntimeRegistry`：全局注册中心（sessions/cameras/pipelines/workers/backends）
+- 实现 `RuntimeHealthMonitor`：健康监控（FPS/latency/memory/errors → EventBus）
+- 实现 `RuntimeMetrics`：Prometheus-ready 指标收集
+- 实现 `RuntimeSignals` 系统：EventSignal / HealthSignal / ErrorSignal / LifecycleSignal
+- 新增 `docs/runtime_engine.md`：Engine Architecture 文档
+- 新增 `test_runtime_engine.py`：Engine 组件测试
+- 测试覆盖增至 **193 个**，全部通过
 
 ### 2026-05-13（v2）
 
