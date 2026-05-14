@@ -14,6 +14,11 @@ class Keypoint:
     y: float
     confidence: float
 
+    def __post_init__(self):
+        self.x = float(self.x)
+        self.y = float(self.y)
+        self.confidence = float(self.confidence)
+
     def to_dict(self) -> dict:
         return {"x": self.x, "y": self.y, "confidence": self.confidence}
 
