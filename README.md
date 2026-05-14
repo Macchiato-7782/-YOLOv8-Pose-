@@ -88,8 +88,8 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（120 个用例）
-python -m pytest test_*.py -v
+# 运行全部测试（156 个用例）
+python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py -v
 
 # 只运行跌倒场景测试
 python -m pytest test_fall_detection.py -v
@@ -101,7 +101,7 @@ python -m pytest test_detector_interface.py -v
 python -m pytest test_backends.py -v
 ```
 
-覆盖 6 个测试模块、120 个用例：跌倒场景、物理特征、跟踪器、跨摄像头匹配、FallDetector 接口、推理后端。
+覆盖 7 个测试模块、156 个用例。
 
 ## 跌倒判断逻辑
 
@@ -361,20 +361,32 @@ ONNX vs Ultralytics:
 ├── main.py                     # 入口，支持单/双摄像头模式 + --headless + --edge
 ├── fall_detection/             # 标准检测模块（可被外部 import）
 │   ├── __init__.py
-│   ├── detector.py             # FallDetector 标准接口
+│   ├── detector.py             # FallDetector 标准接口（orchestration only）
 │   ├── schemas.py              # 输出格式定义与 JSON 序列化
 │   ├── visualizer.py           # 绘图函数（draw_person_info 等）
 │   ├── edge_config.py          # 边缘设备默认参数
-│   └── backends/               # 推理后端抽象层
+│   ├── backends/               # 推理后端抽象层
+│   │   ├── __init__.py
+│   │   ├── base.py             # BaseInferenceBackend 抽象类
+│   │   ├── ultralytics_backend.py  # Ultralytics YOLO 后端
+│   │   ├── onnx_backend.py     # ONNX Runtime 后端
+│   │   ├── postprocess.py      # 统一后处理
+│   │   └── factory.py          # create_backend() 工厂
+│   └── core/                   # AI Monitoring Runtime Core
 │       ├── __init__.py
-│       ├── base.py             # BaseInferenceBackend 抽象类
-│       ├── ultralytics_backend.py  # Ultralytics YOLO 后端
-│       ├── onnx_backend.py     # ONNX Runtime 后端
-│       ├── postprocess.py      # 统一后处理
-│       └── factory.py          # create_backend() 工厂
+│       ├── detection.py        # Detection / Keypoint dataclass
+│       ├── track.py            # TrackState dataclass
+│       ├── event.py            # Event dataclass
+│       ├── frame.py            # FrameContext dataclass
+│       ├── pipeline.py         # DetectionPipeline 统一编排
+│       ├── runtime.py          # EventRuntime 事件生成+去重
+│       ├── serializers.py      # dataclass → JSON-friendly
+│       └── validators.py       # 结构校验
 ├── tools/                      # 开发工具
 │   ├── export_onnx.py          # PT → ONNX 导出
 │   └── benchmark_backend.py    # 后端性能对比
+├── docs/                       # 文档
+│   └── runtime_architecture.md # Runtime Flow 架构
 ├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
 ├── features.py                 # 物理特征计算（旋转能量、重力因子、头部下降）
 ├── tracking.py                 # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
@@ -388,6 +400,7 @@ ONNX vs Ultralytics:
 ├── test_cross_camera.py        # 跨摄像头匹配测试
 ├── test_detector_interface.py  # FallDetector 接口测试
 ├── test_backends.py            # 推理后端测试
+├── test_runtime_pipeline.py    # Runtime Pipeline 测试
 ├── requirements.txt            # 依赖清单
 └── README.md
 ```
@@ -426,7 +439,19 @@ ONNX vs Ultralytics:
 - 新增 `tools/benchmark_backend.py`：多后端性能对比工具
 - 新增 `test_detector_interface.py`：45 个接口测试用例
 - 新增 `test_backends.py`：22 个后端测试用例
-- 测试覆盖从 53 个增至 120 个，全部通过
+
+**AI Monitoring Runtime Core（v3.2）:**
+- 新增 `fall_detection/core/` Runtime Core 模块
+- 实现标准化 Data Model：`Detection` / `Keypoint` / `TrackState` / `Event` / `FrameContext`
+- 实现 `DetectionPipeline`：统一编排 infer → Detection → tracking → TrackState → fall logic → Event → serialize
+- 实现 `EventRuntime`：事件生成 + cooldown 去重 + 防重复
+- 实现 `serializers.py`：dataclass → JSON-friendly dict，零 numpy 泄露
+- 实现 `validators.py`：结构校验（bbox 长度、score 范围、event_type 等）
+- `detector.py` 改为纯 orchestration 层，不直接操作 detection/tracking/events
+- Pipeline 内部统一使用 dataclass objects，最终输出时才 serialize
+- 新增 `docs/runtime_architecture.md`：Runtime Flow 架构文档
+- 新增 `test_runtime_pipeline.py`：数据模型、序列化、校验、Pipeline 兼容性测试
+- 测试覆盖从 53 个增至 **156 个**，全部通过
 
 ### 2026-05-13（v2）
 
