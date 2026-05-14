@@ -88,7 +88,7 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（193 个用例）
+# 运行全部测试（227 个用例）
 python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py test_runtime_integrity.py test_runtime_engine.py -v
 
 # 只运行跌倒场景测试
@@ -104,7 +104,7 @@ python -m pytest test_backends.py -v
 python -m pytest test_runtime_integrity.py -v
 ```
 
-覆盖 9 个测试模块、193 个用例。
+覆盖 10 个测试模块、227 个用例。
 
 ## 跌倒判断逻辑
 
@@ -515,6 +515,20 @@ ONNX vs Ultralytics:
 - 新增 `docs/runtime_engine.md`：Engine Architecture 文档
 - 新增 `test_runtime_engine.py`：Engine 组件测试
 - 测试覆盖增至 **193 个**，全部通过
+
+**Fault-Tolerant Runtime（v3.5）:**
+- 新增 `fall_detection/runtime_state/` 容错运行时状态管理包
+- 实现 `RuntimeStateMachine`：11 状态 + 非法转换 reject + 状态历史
+- 实现 `RuntimePolicy`：overload / reconnect / frame drop / cooldown / retry 策略
+- 实现 `BackpressureController`：自动帧丢弃 / 队列裁剪 / FPS 降级
+- 实现 `DegradationController`：5 级自动降级
+- 实现 `FaultRecovery`：backend/worker/camera/session 自动恢复
+- 实现 `ResourceManager`：CPU / RAM / queue / thermal 实时监控
+- 实现 `RuntimeClock`：统一时间域
+- 实现 `RuntimeDiagnostics`：统一诊断输出
+- 新增 `tools/runtime_chaos_test.py`：Chaos 测试（camera disconnect / CPU spike / queue overflow）
+- 新增 `test_runtime_fault_tolerance.py`：容错测试
+- 测试覆盖增至 **227 个**，全部通过
 
 ### 2026-05-13（v2）
 
