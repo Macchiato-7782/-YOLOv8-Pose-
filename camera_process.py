@@ -114,9 +114,10 @@ def run_roi_inference(model, frame, rois, tracker):
             # 只保留与 ROI 源 bbox 重叠的检测
             from fall_detection.backends.postprocess import ultralytics_results_to_detections  # noqa: E402
             roi_dets = ultralytics_results_to_detections(crop_results)
-            roi_internal = tracker.convert_backend_detections(roi_dets)
-            for det in roi_internal:
-                if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
+            for det in roi_dets:
+                det_bbox = tuple(int(v) for v in det.bbox)
+                if compute_iou(det_bbox, roi_bbox) >= ROI_MATCH_IOU:
+                    det._bbox_tuple = det_bbox
                     roi_detections.append(det)
     except Exception as e:
         logger.warning(f"ROI 推理异常: {e}")
@@ -199,10 +200,29 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
                 # ByteTracker 跟踪推理
                 results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
 
-                # 转换为统一 schema，再转为跟踪器内部格式
-                backend_dets = ultralytics_results_to_detections(results)
-                main_detections = tracker.convert_backend_detections(backend_dets)
-                tracked = tracker.update(main_detections, current_time)
+                # 转换为 Detection 对象 → tracker 直接处理
+                detections = ultralytics_results_to_detections(results)
+                tracked_ts = tracker.update(detections, current_time)
+
+                # 转回 dict 格式用于跨进程传递
+                tracked = []
+                for t in tracked_ts:
+                    tracked.append({
+                        'pid': t.track_id,
+                        'bbox': tuple(int(v) for v in t.bbox),
+                        'center': (int(t.center[0]), int(t.center[1])),
+                        'aspect_ratio': t.aspect_ratio,
+                        'keypoints': getattr(t, '_raw_keypoints', None),
+                        'confs': getattr(t, '_raw_confs', None),
+                        'kp_5': getattr(t, '_kp_5', None),
+                        'is_full_body': getattr(t, '_raw_keypoints', None) is not None,
+                        'is_ghost': t.is_ghost,
+                        'history': t.history if isinstance(t.history, list) else [],
+                        'fall_state': t.fall_state or {},
+                        'angle_keypoints': None,
+                        'hist': None,  # filled below
+                    })
+                tracked = tracked  # now list of dicts
 
                 # ROI 二次推理：每 N 帧推理一次，关联到已有 track
                 roi_interval = _CFG.get('roi_interval', 3)

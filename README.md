@@ -88,8 +88,8 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（156 个用例）
-python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py -v
+# 运行全部测试（174 个用例）
+python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py test_runtime_integrity.py -v
 
 # 只运行跌倒场景测试
 python -m pytest test_fall_detection.py -v
@@ -99,9 +99,12 @@ python -m pytest test_detector_interface.py -v
 
 # 只运行后端测试
 python -m pytest test_backends.py -v
+
+# 只运行 Runtime 完整性测试
+python -m pytest test_runtime_integrity.py -v
 ```
 
-覆盖 7 个测试模块、156 个用例。
+覆盖 8 个测试模块、174 个用例。
 
 ## 跌倒判断逻辑
 
@@ -384,7 +387,8 @@ ONNX vs Ultralytics:
 │       └── validators.py       # 结构校验
 ├── tools/                      # 开发工具
 │   ├── export_onnx.py          # PT → ONNX 导出
-│   └── benchmark_backend.py    # 后端性能对比
+│   ├── benchmark_backend.py    # 后端性能对比
+│   └── check_runtime_purity.py # Runtime 纯度检查
 ├── docs/                       # 文档
 │   └── runtime_architecture.md # Runtime Flow 架构
 ├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
@@ -401,6 +405,7 @@ ONNX vs Ultralytics:
 ├── test_detector_interface.py  # FallDetector 接口测试
 ├── test_backends.py            # 推理后端测试
 ├── test_runtime_pipeline.py    # Runtime Pipeline 测试
+├── test_runtime_integrity.py   # Runtime 完整性测试
 ├── requirements.txt            # 依赖清单
 └── README.md
 ```
@@ -452,6 +457,30 @@ ONNX vs Ultralytics:
 - 新增 `docs/runtime_architecture.md`：Runtime Flow 架构文档
 - 新增 `test_runtime_pipeline.py`：数据模型、序列化、校验、Pipeline 兼容性测试
 - 测试覆盖从 53 个增至 **156 个**，全部通过
+
+**Pure Runtime Refactor（v3.3）:**
+- Runtime 内部彻底禁止 dict：Detection→TrackState→Event 全链路纯对象
+- backend `infer()` 严格返回 `list[Detection]`（含 Keypoint 对象），不再返回 dict
+- tracking.py 输入 `list[Detection]`，输出 `list[TrackState]`，删除 `convert_backend_detections` 等兼容层
+- pipeline.py 纯对象流水线，删除 `_ensure_detections` / isinstance(dict) 等 legacy 适配器
+- serializers.py 成为唯一 object→dict 出口
+- validators.py 在 Runtime 入口强制校验
+- 新增 `core/types.py`：DetectionList / TrackList / EventList 类型别名
+- 新增 `tools/check_runtime_purity.py`：自动扫描 Runtime dict leak
+- 新增 `test_runtime_integrity.py`：数据类型完整性测试
+- 测试覆盖增至 **168 个**，全部通过
+
+**Pure Runtime Refactor（v3.3）:**
+- Runtime 内部彻底禁止 dict：Detection→TrackState→Event 全链路纯对象
+- backend `infer()` 严格返回 `list[Detection]`（含 Keypoint 对象）
+- tracking.py 输入 `list[Detection]`，输出 `list[TrackState]`，删除 `convert_backend_detections` 等兼容层
+- pipeline.py 纯对象流水线，删除 `_ensure_detections` / isinstance(dict) 等 legacy 适配器
+- serializers.py 成为唯一 object→dict 出口
+- validators.py 在 Runtime 入口强制校验
+- 新增 `core/types.py`：DetectionList / TrackList / EventList 类型别名
+- 新增 `tools/check_runtime_purity.py`：自动扫描 Runtime dict leak
+- 新增 `test_runtime_integrity.py`：数据类型完整性测试
+- 测试覆盖增至 **174 个**，全部通过
 
 ### 2026-05-13（v2）
 

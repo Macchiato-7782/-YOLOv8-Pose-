@@ -283,9 +283,29 @@ class TestPipelineCompatibility:
         from fall_detection import FallDetector
         from fall_detection.backends.ultralytics_backend import UltralyticsBackend
 
-        # Mock _init_model to avoid real YOLO loading
         def fake_init(self):
-            self._model = FakeYOLOInstance()
+            class FakeM:
+                backend = "test"
+                device = "cpu"
+                def track(self, *a, **kw):
+                    class R:
+                        class B:
+                            xyxy = np.array([[100, 200, 300, 500]])
+                            conf = np.array([0.85])
+                            id = np.array([1])
+                        boxes = B()
+                        class K:
+                            xy = [np.array([[150.0, 220.0]] * 17)]
+                            conf = [np.array([0.9] * 17)]
+                        keypoints = K()
+                    return [R()]
+                def infer(self, frame):
+                    return []
+                def close(self):
+                    pass
+            self._model = FakeM()
+            self.backend = "test"
+            self.device = "cpu"
 
         with patch.object(UltralyticsBackend, '_init_model', fake_init):
             with patch('os.path.exists', return_value=False):
@@ -301,25 +321,3 @@ class TestPipelineCompatibility:
                 s = json.dumps(result)
                 assert isinstance(s, str)
                 detector.close()
-
-
-class FakeYOLOInstance:
-    def track(self, *args, **kwargs):
-        return [FakeEmptyResults()]
-
-
-class FakeEmptyResults:
-    class FakeBoxes:
-        xyxy = None
-        conf = None
-        id = None
-
-    class FakeKeypoints:
-        xy = None
-        conf = None
-
-    boxes = FakeBoxes()
-    keypoints = None
-
-    def plot(self):
-        return np.zeros((480, 640, 3), dtype=np.uint8)

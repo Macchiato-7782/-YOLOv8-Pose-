@@ -102,9 +102,8 @@ def run_single_camera(args):
 
         try:
             results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
-            backend_dets = ultralytics_results_to_detections(results)
-            main_detections = tracker.convert_backend_detections(backend_dets)
-            tracked = tracker.update(main_detections, current_time)
+            detections = ultralytics_results_to_detections(results)
+            tracked = tracker.update(detections, current_time)
 
             roi_interval = CAM_PROC.get('roi_interval', 3)
             if frame_count % roi_interval == 0 and low_conf_rois:
@@ -121,43 +120,59 @@ def run_single_camera(args):
 
         for person in tracked:
             try:
-                if person.get('is_ghost'):
-                    if 'fall_result' not in person:
-                        person['fall_result'] = {'fall_detected': False, 'confidence': 0, 'state': 'Normal'}
-                    plotted_frame = draw_person_info(plotted_frame, person, person['fall_result'])
+                # person is now TrackState object
+                if person.is_ghost:
+                    if not hasattr(person, '_fall_result') or person._fall_result is None:
+                        person._fall_result = {'fall_detected': False, 'confidence': 0, 'state': 'Normal'}
+                    plotted_frame = draw_person_info(plotted_frame,
+                        {'pid': person.track_id, 'bbox': tuple(int(v) for v in person.bbox), 'is_ghost': True},
+                        person._fall_result if hasattr(person, '_fall_result') else {'fall_detected': False, 'confidence': 0, 'state': 'Normal'})
                     continue
 
-                kpts = person.get('keypoints')
-                confs = person.get('confs')
-                if kpts is not None and confs is not None:
-                    person['angle_keypoints'] = extract_angle_keypoints(kpts, confs)
-                else:
-                    person['angle_keypoints'] = None
+                kps_arr = getattr(person, '_raw_keypoints', None)
+                confs_arr = getattr(person, '_raw_confs', None)
+                angle_kpts = extract_angle_keypoints(kps_arr, confs_arr) if kps_arr is not None and confs_arr is not None else None
 
-                fall_result = evaluate_fall(person, current_time)
-                person['fall_result'] = fall_result
-                plotted_frame = draw_person_info(plotted_frame, person, fall_result)
+                person_data = {
+                    'pid': person.track_id,
+                    'kp_5': getattr(person, '_kp_5', None),
+                    'aspect_ratio': person.aspect_ratio,
+                    'bbox': getattr(person, '_bbox_tuple', tuple(int(v) for v in person.bbox)),
+                    'fall_state': person.fall_state or {},
+                    'history': person.history if isinstance(person.history, list) else [],
+                    'keypoints': kps_arr,
+                    'confs': confs_arr,
+                    'angle_keypoints': angle_kpts,
+                }
+
+                fall_result = evaluate_fall(person_data, current_time)
+                person.fall_state = person_data['fall_state']
+                person._fall_result = fall_result
+                plotted_frame = draw_person_info(plotted_frame,
+                    {'pid': person.track_id, 'bbox': tuple(int(v) for v in person.bbox)},
+                    fall_result)
             except Exception as e:
                 logger.warning(f"单摄处理异常: {e}")
                 traceback.print_exc()
 
         low_conf_rois = []
         for person in tracked:
-            if person.get('fall_result', {}).get('state') in ('Potential Fall', 'FALL'):
-                pid = person['pid']
-                predicted = tracker._predict_position(tracker.person_history.get(pid, {}))
+            fr = getattr(person, '_fall_result', None)
+            if fr and fr.get('state', '') in ('Potential Fall', 'FALL'):
+                predicted = tracker._predict_position(tracker.person_history.get(person.track_id, {}))
                 low_conf_rois.append({
-                    'bbox': person['bbox'],
-                    'pid': pid,
+                    'bbox': tuple(int(v) for v in person.bbox),
+                    'pid': person.track_id,
                     'predicted_center': predicted,
                 })
 
         fall_results = []
         for p in tracked:
-            if 'fall_result' in p:
-                fr = dict(p['fall_result'])
-                fr['is_ghost'] = p.get('is_ghost', False)
-                fall_results.append(fr)
+            fr = getattr(p, '_fall_result', None)
+            if fr:
+                fr_d = dict(fr)
+                fr_d['is_ghost'] = p.is_ghost
+                fall_results.append(fr_d)
         plotted_frame = draw_fall_alert(plotted_frame, fall_results)
 
         fps = frame_count / (time.time() - fps_t0 + 1e-8)

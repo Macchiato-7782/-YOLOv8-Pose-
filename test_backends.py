@@ -6,8 +6,8 @@
 import sys
 import os
 import json
-import pytest
 import numpy as np
+import pytest
 from unittest.mock import patch, MagicMock, PropertyMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '.'))
@@ -18,6 +18,7 @@ from fall_detection.backends.postprocess import (
     ultralytics_results_to_detections,
     onnx_outputs_to_detections,
 )
+from fall_detection.core.detection import Detection, Keypoint
 
 
 def make_test_frame(w=640, h=480):
@@ -158,26 +159,24 @@ class TestUltralyticsBackend:
             assert len(detections) > 0
 
             det = detections[0]
-            # 验证 schema
-            assert "bbox" in det
-            assert isinstance(det["bbox"], list)
-            assert len(det["bbox"]) == 4
+            assert hasattr(det, 'bbox')
+            assert isinstance(det.bbox, list)
+            assert len(det.bbox) == 4
 
-            assert "score" in det
-            assert isinstance(det["score"], float)
+            assert hasattr(det, 'score')
+            assert isinstance(det.score, float)
 
-            assert "class_id" in det
-            assert det["class_id"] == 0
+            assert hasattr(det, 'class_id')
+            assert det.class_id == 0
 
-            assert "track_id" in det
-            assert det["track_id"] is not None
+            assert hasattr(det, 'track_id')
+            assert det.track_id is not None
 
-            assert "keypoints" in det
-            assert isinstance(det["keypoints"], list)
-            if len(det["keypoints"]) > 0:
-                kp = det["keypoints"][0]
-                assert isinstance(kp, list)
-                assert len(kp) == 3  # [x, y, conf]
+            assert hasattr(det, 'keypoints')
+            assert isinstance(det.keypoints, list)
+            if len(det.keypoints) > 0:
+                kp = det.keypoints[0]
+                assert isinstance(kp, Keypoint)
 
             backend.close()
 
@@ -222,10 +221,10 @@ class TestPostprocess:
         dets = ultralytics_results_to_detections(results)
         assert len(dets) == 1
         det = dets[0]
-        assert det["bbox"] == [100.0, 200.0, 300.0, 500.0]
-        assert det["score"] == 0.85
-        assert det["track_id"] == 1
-        assert len(det["keypoints"]) == 17
+        assert det.bbox == [100.0, 200.0, 300.0, 500.0]
+        assert det.score == 0.85
+        assert det.track_id == 1
+        assert len(det.keypoints) == 17
 
     def test_bbox_is_list(self):
         results = FakeResults(
@@ -235,7 +234,7 @@ class TestPostprocess:
             keypoints_all_conf=[[0.5] * 17],
         )
         dets = ultralytics_results_to_detections(results)
-        assert isinstance(dets[0]["bbox"], list)
+        assert isinstance(dets[0].bbox, list)
 
     def test_keypoints_is_list(self):
         results = FakeResults(
@@ -245,8 +244,8 @@ class TestPostprocess:
             keypoints_all_conf=[[0.5] * 17],
         )
         dets = ultralytics_results_to_detections(results)
-        assert isinstance(dets[0]["keypoints"], list)
-        assert isinstance(dets[0]["keypoints"][0], list)
+        assert isinstance(dets[0].keypoints, list)
+        assert isinstance(dets[0].keypoints[0], Keypoint)
 
     def test_no_track_ids(self):
         results = FakeResults(
@@ -257,7 +256,7 @@ class TestPostprocess:
             track_ids=None,
         )
         dets = ultralytics_results_to_detections(results)
-        assert dets[0]["track_id"] is None
+        assert dets[0].track_id is None
 
     def test_empty_results(self):
         # 空结果
@@ -277,7 +276,7 @@ class TestPostprocess:
             track_ids=[1],
         )
         dets = ultralytics_results_to_detections(results)
-        s = json.dumps(dets)
+        s = json.dumps([d.to_dict() for d in dets])
         assert isinstance(s, str)
 
     def test_onnx_outputs_to_detections_empty(self):
@@ -298,9 +297,9 @@ class TestPostprocess:
         dets = onnx_outputs_to_detections(output, (480, 640), conf_threshold=0.5)
         assert len(dets) >= 1
         det = dets[0]
-        assert "bbox" in det
-        assert isinstance(det["bbox"], list)
-        assert det["track_id"] is None  # ONNX backend 不做跟踪
+        assert hasattr(det, 'bbox')
+        assert isinstance(det.bbox, list)
+        assert det.track_id is None
 
 
 # ============================================================
@@ -373,44 +372,30 @@ class TestDetectorBackendClean:
 
 class TestTrackerConvert:
     def test_convert(self):
+        import time
         from tracking import SingleCameraTracker
+        from fall_detection.core.detection import Detection, Keypoint
 
         tracker = SingleCameraTracker()
-        dets = [{
-            "bbox": [100, 200, 300, 500],
-            "score": 0.85,
-            "class_id": 0,
-            "track_id": None,
-            "keypoints": [[150.0, 220.0, 0.9], [180.0, 250.0, 0.8], [160.0, 300.0, 0.7],
-                          [140.0, 350.0, 0.6], [260.0, 350.0, 0.5], [120.0, 280.0, 0.4],
-                          [280.0, 280.0, 0.3], [100.0, 200.0, 0.1], [300.0, 200.0, 0.1],
-                          [130.0, 380.0, 0.5], [270.0, 380.0, 0.5], [100.0, 300.0, 0.1],
-                          [300.0, 300.0, 0.1], [140.0, 420.0, 0.8], [260.0, 420.0, 0.8],
-                          [100.0, 500.0, 0.1], [300.0, 500.0, 0.1]],
-        }]
+        kps = [Keypoint(x=150.0, y=220.0, confidence=0.9) for _ in range(17)]
+        dets = [Detection(bbox=[100, 200, 300, 500], score=0.85, keypoints=kps)]
 
-        converted = tracker.convert_backend_detections(dets)
-        assert len(converted) == 1
-        c = converted[0]
-        assert "bbox" in c
-        assert isinstance(c["bbox"], tuple)
-        assert c["track_id"] is None  # 由 _assign_ids 分配
+        tracks = tracker.update(dets, time.time())
+        assert len(tracks) == 1
+        t = tracks[0]
+        assert t.track_id is not None
+        assert isinstance(t.bbox, list)
 
     def test_assign_ids(self):
         import time
         from tracking import SingleCameraTracker
+        from fall_detection.core.detection import Detection, Keypoint
 
         tracker = SingleCameraTracker()
-        dets = tracker.convert_backend_detections([{
-            "bbox": [100, 200, 300, 500],
-            "score": 0.85,
-            "class_id": 0,
-            "track_id": None,
-            "keypoints": [[150.0, 220.0, 0.9]] * 17,
-        }])
+        kps = [Keypoint(x=150.0, y=220.0, confidence=0.9) for _ in range(17)]
+        dets = [Detection(bbox=[100, 200, 300, 500], score=0.85, keypoints=kps)]
 
-        # assign_ids 应该在 update 中调用
         updated = tracker.update(dets, time.time())
         assert len(updated) == 1
-        assert isinstance(updated[0]["pid"], int)
-        assert updated[0]["pid"] >= 1
+        assert isinstance(updated[0].track_id, int)
+        assert updated[0].track_id >= 1
