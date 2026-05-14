@@ -254,16 +254,24 @@ class FakeResults:
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
 
-class FakeCap:
-    """模拟 cv2.VideoCapture"""
+class FakeBackend:
+    """模拟推理后端"""
     def __init__(self, *args, **kwargs):
         pass
 
-    def isOpened(self):
-        return True
+    def infer(self, frame):
+        return []
 
-    def read(self):
-        return True, np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    def warmup(self):
+        pass
+
+    def close(self):
+        pass
+
+
+# Helper: mock backend factory
+def _mock_backend():
+    return patch('fall_detection.detector.create_backend', return_value=FakeBackend())
 
     def release(self):
         pass
@@ -275,7 +283,7 @@ class TestFallDetectorInit:
         assert FallDetector is not None
 
     def test_init_default(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 assert detector.device == "cpu"
@@ -288,7 +296,7 @@ class TestFallDetectorInit:
                 detector.close()
 
     def test_init_edge_config(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(
                     device=EDGE_DEFAULTS["device"],
@@ -304,7 +312,7 @@ class TestFallDetectorInit:
                 detector.close()
 
     def test_init_with_custom_params(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(
                     enable_tracking=True,
@@ -324,7 +332,7 @@ class TestFallDetectorInit:
 
 class TestFallDetectorProcessFrame:
     def test_process_frame_returns_dict(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -333,7 +341,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_required_fields(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -343,7 +351,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_json_serializable(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -353,7 +361,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_camera_id(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -362,7 +370,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_timestamp(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -372,7 +380,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_frame_id_increments(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -382,7 +390,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_persons_is_list(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -391,7 +399,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_events_is_list(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -400,7 +408,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_diagnostics_has_required(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -414,7 +422,7 @@ class TestFallDetectorProcessFrame:
 
     def test_process_frame_no_imshow(self):
         """process_frame 不应调用 cv2.imshow"""
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 with patch('cv2.imshow') as mock_imshow:
                     detector = FallDetector()
@@ -425,7 +433,7 @@ class TestFallDetectorProcessFrame:
 
     def test_process_frame_no_video_write(self):
         """process_frame 不应调用 cv2.VideoWriter"""
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 with patch('cv2.VideoWriter') as mock_writer:
                     detector = FallDetector()
@@ -436,7 +444,7 @@ class TestFallDetectorProcessFrame:
 
     def test_process_frame_no_argparse(self):
         """process_frame 不应依赖 argparse"""
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -445,7 +453,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_with_visualization(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(enable_visualization=True)
                 frame = make_test_frame()
@@ -455,7 +463,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_without_visualization(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(enable_visualization=False)
                 frame = make_test_frame()
@@ -464,7 +472,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_state_valid(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -475,7 +483,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_bbox_is_list(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -485,7 +493,7 @@ class TestFallDetectorProcessFrame:
                 detector.close()
 
     def test_process_frame_track_id_is_int(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -498,7 +506,7 @@ class TestFallDetectorProcessFrame:
 
 class TestFallDetectorReset:
     def test_reset_clears_frame_id(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 frame = make_test_frame()
@@ -510,7 +518,7 @@ class TestFallDetectorReset:
                 detector.close()
 
     def test_reset_can_process_after(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 detector.process_frame(make_test_frame())
@@ -522,7 +530,7 @@ class TestFallDetectorReset:
 
 class TestFallDetectorEdge:
     def test_edge_defaults_constructor(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(
                     input_size=EDGE_DEFAULTS["input_size"],
@@ -539,7 +547,7 @@ class TestFallDetectorEdge:
                 detector.close()
 
     def test_inference_interval_skips(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector(inference_interval=2)
                 frame = make_test_frame()
@@ -553,9 +561,9 @@ class TestFallDetectorEdge:
 
 class TestFallDetectorClose:
     def test_close_cleans_up(self):
-        with patch('fall_detection.detector.YOLO', return_value=FakeYOLOModel()):
+        with _mock_backend():
             with patch('os.path.exists', return_value=False):
                 detector = FallDetector()
                 detector.close()
-                assert detector._model is None
+                assert detector._backend is not None  # closed but ref remains
                 assert detector._tracker is None

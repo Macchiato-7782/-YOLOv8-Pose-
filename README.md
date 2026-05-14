@@ -88,7 +88,7 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（98 个用例）
+# 运行全部测试（120 个用例）
 python -m pytest test_*.py -v
 
 # 只运行跌倒场景测试
@@ -96,9 +96,12 @@ python -m pytest test_fall_detection.py -v
 
 # 只运行接口测试
 python -m pytest test_detector_interface.py -v
+
+# 只运行后端测试
+python -m pytest test_backends.py -v
 ```
 
-覆盖 5 个测试模块、98 个用例：跌倒场景、物理特征计算、跟踪器、跨摄像头匹配、FallDetector 接口。
+覆盖 6 个测试模块、120 个用例：跌倒场景、物理特征、跟踪器、跨摄像头匹配、FallDetector 接口、推理后端。
 
 ## 跌倒判断逻辑
 
@@ -295,6 +298,63 @@ detector = FallDetector(
 
 后续计划扩展 ONNX / OpenVINO / NCNN 后端，只需切换 `backend` 参数即可。
 
+## 推理后端
+
+支持多种推理后端，通过 `backend` 参数切换。
+
+| 后端 | 参数值 | 依赖 | 适合场景 |
+|------|--------|------|----------|
+| Ultralytics | `"ultralytics"` | ultralytics + PyTorch | 开发调试、GPU 服务器 |
+| ONNX Runtime | `"onnx"` | onnxruntime | 边缘设备、低功耗部署 |
+| OpenVINO | `"openvino"` | (预留) | Intel CPU/VPU |
+| NCNN | `"ncnn"` | (预留) | ARM Linux / Android |
+
+### 使用 ONNX 后端
+
+```bash
+# 1. 导出 ONNX 模型
+python tools/export_onnx.py
+
+# 2. 使用 ONNX 后端
+from fall_detection import FallDetector
+
+detector = FallDetector(
+    backend="onnx",
+    model_path="yolov8n-pose.onnx",
+    device="cpu",
+    input_size=320,
+)
+```
+
+### Benchmark 工具
+
+```bash
+python tools/benchmark_backend.py
+```
+
+输出示例：
+
+```
+==================================================
+Backend Benchmark Results
+==================================================
+
+Backend:           ultralytics
+FPS:               12.4
+Avg Latency:       80.6ms
+Total Memory:      1200MB
+
+Backend:           onnx
+FPS:               24.7
+Avg Latency:       40.5ms
+Total Memory:      420MB
+
+ONNX vs Ultralytics:
+  FPS:         12.4 -> 24.7  (2.0x)
+  Memory:      1200MB -> 420MB  (780MB saved)
+==================================================
+```
+
 ## 项目结构
 
 ```
@@ -304,7 +364,17 @@ detector = FallDetector(
 │   ├── detector.py             # FallDetector 标准接口
 │   ├── schemas.py              # 输出格式定义与 JSON 序列化
 │   ├── visualizer.py           # 绘图函数（draw_person_info 等）
-│   └── edge_config.py          # 边缘设备默认参数
+│   ├── edge_config.py          # 边缘设备默认参数
+│   └── backends/               # 推理后端抽象层
+│       ├── __init__.py
+│       ├── base.py             # BaseInferenceBackend 抽象类
+│       ├── ultralytics_backend.py  # Ultralytics YOLO 后端
+│       ├── onnx_backend.py     # ONNX Runtime 后端
+│       ├── postprocess.py      # 统一后处理
+│       └── factory.py          # create_backend() 工厂
+├── tools/                      # 开发工具
+│   ├── export_onnx.py          # PT → ONNX 导出
+│   └── benchmark_backend.py    # 后端性能对比
 ├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
 ├── features.py                 # 物理特征计算（旋转能量、重力因子、头部下降）
 ├── tracking.py                 # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
@@ -317,6 +387,7 @@ detector = FallDetector(
 ├── test_tracking.py            # 跟踪器测试
 ├── test_cross_camera.py        # 跨摄像头匹配测试
 ├── test_detector_interface.py  # FallDetector 接口测试
+├── test_backends.py            # 推理后端测试
 ├── requirements.txt            # 依赖清单
 └── README.md
 ```
@@ -341,8 +412,21 @@ detector = FallDetector(
 - 新增 `--edge` CLI 参数：一键切换低功耗默认配置
 - 核心逻辑支持 headless 模式：不依赖 `cv2.imshow`、`argparse`
 - 预留 `external_tracks` / `backend` 参数，便于后续接入人脸识别项目和 ONNX/OpenVINO 后端
+
+**推理后端抽象层（v3.1）:**
+- 新增 `fall_detection/backends/` 推理后端抽象层
+- 实现 `BaseInferenceBackend` 抽象基类，统一 infer / warmup / close 接口
+- 实现 `UltralyticsBackend`：封装 YOLO.track()，返回统一 detection schema
+- 实现 `ONNXBackend`：基于 onnxruntime，零 PyTorch 依赖，适合边缘设备
+- 实现 `create_backend()` 工厂函数：一键切换 ultralytics / onnx 后端，预留 openvino / ncnn
+- 实现 `postprocess.py`：统一后处理（bbox 解码、NMS、关键点提取）
+- `detector.py` 不再直接 import YOLO，完全 backend 无关
+- `tracking.py` 不再 import ultralytics，新增 IoU 匹配 `_assign_ids()`
+- 新增 `tools/export_onnx.py`：PT → ONNX 模型导出
+- 新增 `tools/benchmark_backend.py`：多后端性能对比工具
 - 新增 `test_detector_interface.py`：45 个接口测试用例
-- 测试覆盖从 53 个增至 98 个，全部通过
+- 新增 `test_backends.py`：22 个后端测试用例
+- 测试覆盖从 53 个增至 120 个，全部通过
 
 ### 2026-05-13（v2）
 

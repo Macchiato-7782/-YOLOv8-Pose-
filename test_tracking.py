@@ -51,14 +51,9 @@ def make_detection(center, bbox=None, is_full_body=True, kp_5=None):
 # ============================================================
 
 class TestExtractDetections:
-    def test_empty_results(self):
+    def test_empty_detections(self):
         tracker = SingleCameraTracker()
-
-        class MockResults:
-            keypoints = None
-            boxes = None
-
-        result = tracker.extract_detections(MockResults())
+        result = tracker.convert_backend_detections([])
         assert result == []
 
 

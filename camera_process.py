@@ -112,8 +112,10 @@ def run_roi_inference(model, frame, rois, tracker):
                         kp.data[..., 1] += ey1
 
             # 只保留与 ROI 源 bbox 重叠的检测
-            roi_dets = tracker.extract_detections(crop_results)
-            for det in roi_dets:
+            from fall_detection.backends.postprocess import ultralytics_results_to_detections  # noqa: E402
+            roi_dets = ultralytics_results_to_detections(crop_results)
+            roi_internal = tracker.convert_backend_detections(roi_dets)
+            for det in roi_internal:
                 if compute_iou(det['bbox'], roi_bbox) >= ROI_MATCH_IOU:
                     roi_detections.append(det)
     except Exception as e:
@@ -174,6 +176,8 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
         t0 = time.time()
         low_conf_rois = []  # ROI 二次推理区域
 
+        from fall_detection.backends.postprocess import ultralytics_results_to_detections  # noqa: E402
+
         while not stop_event.is_set():
             ret, frame = cap.read()
             if not ret:
@@ -195,8 +199,9 @@ def camera_process(camera_id, queue, model_path, stop_event, is_video=False):
                 # ByteTracker 跟踪推理
                 results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
 
-                # 提取跟踪结果
-                main_detections = tracker.extract_detections(results)
+                # 转换为统一 schema，再转为跟踪器内部格式
+                backend_dets = ultralytics_results_to_detections(results)
+                main_detections = tracker.convert_backend_detections(backend_dets)
                 tracked = tracker.update(main_detections, current_time)
 
                 # ROI 二次推理：每 N 帧推理一次，关联到已有 track

@@ -30,6 +30,7 @@ from camera_process import camera_process, extract_angle_keypoints, run_roi_infe
 from config import CAM_PROC
 from fall_detection.visualizer import draw_person_info, draw_fall_alert, draw_skeleton
 from fall_detection.edge_config import EDGE_DEFAULTS
+from fall_detection.backends.postprocess import ultralytics_results_to_detections
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL = os.path.join(SCRIPT_DIR, 'yolov8n-pose.pt')
@@ -101,7 +102,8 @@ def run_single_camera(args):
 
         try:
             results = model.track(frame, conf=0.35, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
-            main_detections = tracker.extract_detections(results)
+            backend_dets = ultralytics_results_to_detections(results)
+            main_detections = tracker.convert_backend_detections(backend_dets)
             tracked = tracker.update(main_detections, current_time)
 
             roi_interval = CAM_PROC.get('roi_interval', 3)
@@ -449,6 +451,95 @@ def run_dual_camera(args):
     if output_video:
         output_video.release()
     cv2.destroyAllWindows()
+
+
+# ============================================================
+# 边缘模式（带窗口）
+# ============================================================
+
+def run_single_camera_edge(args):
+    """边缘模式：FallDetector + 边缘配置 + 窗口显示"""
+    import numpy as np
+    from fall_detection import FallDetector, EDGE_DEFAULTS
+
+    if args.video:
+        cap = cv2.VideoCapture(args.video[0])
+        if not cap.isOpened():
+            logger.error(f"无法打开视频: {args.video[0]}")
+            return
+    else:
+        cap = None
+        cam_ids = args.cam_ids if args.cam_ids else [0]
+        for cam_id in cam_ids:
+            logger.info(f"尝试摄像头 {cam_id}...")
+            test_cap = cv2.VideoCapture(cam_id)
+            if test_cap.isOpened():
+                ret, _ = test_cap.read()
+                if ret:
+                    cap = test_cap
+                    logger.info(f"摄像头 {cam_id} 可用")
+                    break
+                else:
+                    test_cap.release()
+            else:
+                test_cap.release()
+        if cap is None:
+            logger.error("所有摄像头均不可用")
+            return
+
+    detector = FallDetector(
+        model_path=args.model,
+        device=EDGE_DEFAULTS["device"],
+        input_size=EDGE_DEFAULTS["input_size"],
+        inference_interval=EDGE_DEFAULTS["inference_interval"],
+        enable_roi=EDGE_DEFAULTS["enable_roi"],
+        enable_visualization=True,
+        max_persons=EDGE_DEFAULTS["max_persons"],
+    )
+    camera_id = f"cam_{args.cam_ids[0]}" if args.cam_ids else "cam_0"
+
+    logger.info(f"边缘模式启动 (input_size=320, interval=2, max_persons=3)，按 ESC 退出")
+
+    output_video = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            for retry in range(3):
+                time.sleep(0.05)
+                ret, frame = cap.read()
+                if ret:
+                    break
+        if not ret:
+            logger.warning("视频结束或无法读取帧")
+            break
+
+        result = detector.process_frame(frame, camera_id=camera_id)
+        annotated = result.get("annotated_frame", frame)
+
+        for event in result.get("events", []):
+            logger.info(f"[EVENT] {event['event_type']} track={event['track_id']} conf={event['confidence']:.2f}")
+
+        if args.save_output and output_video is None:
+            fourcc = cv2.VideoWriter_fourcc(*'MP42')
+            output_video = cv2.VideoWriter(
+                filename='output_edge.avi', fourcc=fourcc,
+                fps=18, frameSize=(annotated.shape[1], annotated.shape[0])
+            )
+        if output_video is not None:
+            output_video.write(annotated)
+
+        cv2.imshow("Fall Detection - Edge Mode", annotated)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            logger.info("ESC 退出")
+            break
+
+    cap.release()
+    if output_video:
+        output_video.release()
+    cv2.destroyAllWindows()
+    detector.close()
 
 
 # ============================================================
@@ -868,6 +959,8 @@ def main():
             run_dual_headless(args)
         else:
             logger.error(f"不支持 {args.num_cams} 个摄像头")
+    elif args.edge and args.num_cams == 1:
+        run_single_camera_edge(args)
     elif args.num_cams == 1:
         run_single_camera(args)
     elif args.num_cams == 2:
