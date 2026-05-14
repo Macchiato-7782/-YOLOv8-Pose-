@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/27710724/README.md)
 # Real-Time Fall Detection
 
 基于 YOLOv8-Pose 的实时人体跌倒检测系统，支持**单摄像头**和**双摄像头**模式。
@@ -7,6 +6,8 @@
 - 双摄像头：多进程并行 + HSV 直方图跨摄像头匹配 + 稳定婚姻算法 + 双视角交叉验证
 - 跟踪方案：Ultralytics 内置 ByteTracker（卡尔曼滤波 + 级联匹配）
 - 物理特征降噪：EMA 平滑 + Savitzky-Golay 滤波
+- **标准接口**：FallDetector 类，可被其他项目直接 import，返回 JSON-friendly 结构化结果
+- **边缘部署**：支持低功耗配置（跳帧推理、限人数、关 ROI），后续可扩展 ONNX/OpenVINO/NCNN
 
 ## 效果
 
@@ -55,7 +56,7 @@ pip install -r requirements.txt
 ## 运行
 
 ```bash
-# 单摄像头
+# 单摄像头（Demo 模式）
 python main.py
 
 # 单视频文件
@@ -66,6 +67,15 @@ python main.py --num_cams 2 --cam_ids 0 1
 
 # 双视频文件
 python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
+
+# Headless 模式（无窗口，打印结构化结果）
+python main.py --headless
+
+# 边缘设备低功耗模式
+python main.py --edge
+
+# 边缘 + Headless 组合
+python main.py --edge --headless
 
 # 保存输出视频
 python main.py --num_cams 2 --cam_ids 0 1 --save_output
@@ -78,14 +88,17 @@ python main.py --num_cams 2 --cam_ids 0 1 --save_output
 不依赖摄像头，用合成数据验证检测逻辑：
 
 ```bash
-# 运行全部测试（53 个用例）
+# 运行全部测试（98 个用例）
 python -m pytest test_*.py -v
 
 # 只运行跌倒场景测试
 python -m pytest test_fall_detection.py -v
+
+# 只运行接口测试
+python -m pytest test_detector_interface.py -v
 ```
 
-覆盖 4 个测试模块、53 个用例：跌倒场景、物理特征计算、跟踪器、跨摄像头匹配。
+覆盖 5 个测试模块、98 个用例：跌倒场景、物理特征计算、跟踪器、跨摄像头匹配、FallDetector 接口。
 
 ## 跌倒判断逻辑
 
@@ -133,9 +146,12 @@ python -m pytest test_fall_detection.py -v
 |------|--------|------|
 | `--model` | yolov8n-pose.pt | YOLO 模型路径 |
 | `--num_cams` | 1 | 摄像头数量 |
-| `--cam_ids` | 1 | 摄像头 ID |
+| `--cam_ids` | 0 | 摄像头 ID |
 | `--video` | None | 视频文件路径 |
 | `--save_output` | False | 保存输出视频 |
+| `--debug` | False | 启用调试日志 |
+| `--headless` | False | 无窗口模式，打印结构化结果 |
+| `--edge` | False | 边缘设备低功耗模式 |
 
 ## 依赖
 
@@ -151,22 +167,157 @@ python -m pytest test_fall_detection.py -v
 
 首次使用摄像头需要授权：系统设置 → 隐私与安全性 → 摄像头 → 打开"终端"。
 
+## 作为模块接入其他项目
+
+### 标准接口
+
+```python
+from fall_detection import FallDetector
+import cv2
+
+detector = FallDetector(
+    model_path="yolov8n-pose.pt",
+    device="cpu",
+    input_size=320,
+    inference_interval=2,
+    enable_roi=False,
+    enable_visualization=False,
+)
+
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    result = detector.process_frame(
+        frame,
+        camera_id="cam_0"
+    )
+
+    for event in result["events"]:
+        if event["event_type"] == "fall_confirmed":
+            print("Fall detected:", event)
+
+cap.release()
+detector.close()
+```
+
+### 输出格式
+
+```json
+{
+    "module": "fall_detection",
+    "camera_id": "cam_0",
+    "timestamp": 1710000000.0,
+    "frame_id": 12,
+    "persons": [
+        {
+            "track_id": 1,
+            "bbox": [100, 200, 300, 500],
+            "center": [200, 350],
+            "state": "fall",
+            "fall_detected": true,
+            "confidence": 0.6,
+            "is_ghost": false,
+            "keypoints": [[100.0, 200.0, 0.9], ...]
+        }
+    ],
+    "events": [
+        {
+            "event_type": "fall_confirmed",
+            "track_id": 1,
+            "camera_id": "cam_0",
+            "timestamp": 1710000000.0,
+            "confidence": 0.6,
+            "bbox": [100, 200, 300, 500],
+            "state": "fall"
+        }
+    ],
+    "diagnostics": {
+        "fps": 15.2,
+        "backend": "ultralytics",
+        "device": "cpu",
+        "inference_ran": true
+    }
+}
+```
+
+所有字段均可 `json.dumps` 序列化。`numpy` 类型已自动转换为 Python 原生类型。
+
+### FallDetector 参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model_path` | str | yolov8n-pose.pt | 模型文件路径 |
+| `config_path` | str | config.yaml | 配置文件路径 |
+| `device` | str | "cpu" | 推理设备 |
+| `backend` | str | "ultralytics" | 推理后端（预留 onnx/openvino/ncnn） |
+| `enable_tracking` | bool | True | 启用 ByteTracker |
+| `enable_visualization` | bool | False | 在结果中附加标注图像 |
+| `enable_roi` | bool | False | 启用 ROI 二次推理 |
+| `inference_interval` | int | 1 | 每 N 帧推理一次 |
+| `input_size` | int | 640 | 模型输入分辨率 |
+| `max_persons` | int | None | 最多跟踪人数 |
+
+### Headless 模式
+
+```bash
+# 不显示窗口，打印结构化结果
+python main.py --headless
+
+# 边缘设备低功耗模式
+python main.py --edge --headless
+```
+
+## 边缘设备建议配置
+
+| 设备 | input_size | inference_interval | enable_roi | max_persons |
+|------|-----------|-------------------|------------|-------------|
+| 树莓派 4B | 320 | 2 | False | 1-2 |
+| NVIDIA Jetson Nano | 320 | 1 | False | 2-3 |
+| Intel NUC / 普通 PC | 640 | 1 | True | None |
+
+边缘设备初始化示例：
+
+```python
+detector = FallDetector(
+    model_path="yolov8n-pose.pt",
+    device="cpu",
+    input_size=320,
+    inference_interval=2,
+    enable_roi=False,
+    enable_visualization=False,
+    max_persons=3,
+)
+```
+
+后续计划扩展 ONNX / OpenVINO / NCNN 后端，只需切换 `backend` 参数即可。
+
 ## 项目结构
 
 ```
-├── main.py                 # 入口，支持单/双摄像头模式
-├── fall_logic.py           # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
-├── features.py             # 物理特征计算（旋转能量、重力因子、头部下降）
-├── tracking.py             # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
-├── cross_camera.py         # 跨摄像头匹配（直方图 + 稳定婚姻算法）
-├── camera_process.py       # 摄像头处理进程（多进程架构）
-├── config.py               # 配置加载器
-├── config.yaml             # 所有可调参数（阈值、窗口、超时等）
-├── test_fall_detection.py  # 跌倒场景测试（7 个场景）
-├── test_features.py        # 物理特征测试
-├── test_tracking.py        # 跟踪器测试
-├── test_cross_camera.py    # 跨摄像头匹配测试
-├── requirements.txt        # 依赖清单
+├── main.py                     # 入口，支持单/双摄像头模式 + --headless + --edge
+├── fall_detection/             # 标准检测模块（可被外部 import）
+│   ├── __init__.py
+│   ├── detector.py             # FallDetector 标准接口
+│   ├── schemas.py              # 输出格式定义与 JSON 序列化
+│   ├── visualizer.py           # 绘图函数（draw_person_info 等）
+│   └── edge_config.py          # 边缘设备默认参数
+├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
+├── features.py                 # 物理特征计算（旋转能量、重力因子、头部下降）
+├── tracking.py                 # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
+├── cross_camera.py             # 跨摄像头匹配（直方图 + 稳定婚姻算法）
+├── camera_process.py           # 摄像头处理进程（多进程架构）
+├── config.py                   # 配置加载器
+├── config.yaml                 # 所有可调参数（阈值、窗口、超时等）
+├── test_fall_detection.py      # 跌倒场景测试
+├── test_features.py            # 物理特征测试
+├── test_tracking.py            # 跟踪器测试
+├── test_cross_camera.py        # 跨摄像头匹配测试
+├── test_detector_interface.py  # FallDetector 接口测试
+├── requirements.txt            # 依赖清单
 └── README.md
 ```
 
@@ -177,6 +328,21 @@ python -m pytest test_fall_detection.py -v
 - [COCO Keypoints](https://cocodataset.org/#keypoints-2017)
 
 ## 更新日志
+
+### 2026-05-14（v3）
+
+**SDK 化与边缘部署:**
+- 新增 `fall_detection/` 标准检测包，可被外部项目直接 `import` 调用
+- 新增 `FallDetector` 类作为唯一对外接口，返回 JSON-friendly 结构化结果
+- 新增 `schemas.py`：numpy→Python 类型自动转换，`json.dumps` 可直接序列化
+- 新增 `edge_config.py`：边缘设备默认参数（input_size=320, interval=2 等）
+- 新增 `visualizer.py`：从 main.py 迁移绘图函数，可选调用
+- 新增 `--headless` CLI 参数：无窗口模式，打印结构化结果摘要
+- 新增 `--edge` CLI 参数：一键切换低功耗默认配置
+- 核心逻辑支持 headless 模式：不依赖 `cv2.imshow`、`argparse`
+- 预留 `external_tracks` / `backend` 参数，便于后续接入人脸识别项目和 ONNX/OpenVINO 后端
+- 新增 `test_detector_interface.py`：45 个接口测试用例
+- 测试覆盖从 53 个增至 98 个，全部通过
 
 ### 2026-05-13（v2）
 
