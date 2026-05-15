@@ -1,181 +1,476 @@
-# Real-Time Fall Detection
+# AI Fall Detection System
 
-基于 YOLOv8-Pose 的实时人体跌倒检测系统，支持**单摄像头**和**双摄像头**模式。
+<p align="center">
+  <img src="https://img.shields.io/badge/Version-v3.5-brightgreen" alt="Version">
+  <img src="https://img.shields.io/badge/Python-3.12-blue?logo=python" alt="Python">
+  <img src="https://img.shields.io/badge/YOLOv8-Pose-orange?logo=yolo" alt="YOLO">
+  <img src="https://img.shields.io/badge/ONNX-Runtime-005CED?logo=onnx" alt="ONNX">
+  <img src="https://img.shields.io/badge/Edge-Ready-brightgreen" alt="Edge">
+  <img src="https://img.shields.io/badge/Fault_Tolerant-blue" alt="Fault Tolerant">
+  <img src="https://img.shields.io/badge/Tests-227/227-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/License-MIT-lightgrey" alt="License">
+</p>
 
-- 单摄像头：四路检测（几何 + 物理 + 侧倒 + 地面） + 滑动窗口 + 持续时间确认
-- 双摄像头：多进程并行 + HSV 直方图跨摄像头匹配 + 稳定婚姻算法 + 双视角交叉验证
-- 跟踪方案：Ultralytics 内置 ByteTracker（卡尔曼滤波 + 级联匹配）
-- 物理特征降噪：EMA 平滑 + Savitzky-Golay 滤波
-- **标准接口**：FallDetector 类，可被其他项目直接 import，返回 JSON-friendly 结构化结果
-- **边缘部署**：支持低功耗配置（跳帧推理、限人数、关 ROI），后续可扩展 ONNX/OpenVINO/NCNN
+<p align="center">
+  <b>A production-grade fault-tolerant edge AI runtime — YOLOv8-Pose + ByteTrack + ONNX Runtime + pure object pipeline + Runtime Engine.</b>
+</p>
 
-## 效果
+---
 
-- 绿色标注：正常状态
-- 橙色标注：可能跌倒（计时中）
-- 红色标注：确认跌倒
-- 黄色标注：全局 ID（双摄像头模式下同一个人的统一编号）
+## Introduction
 
-## 技术方案
+**AI Fall Detection System** is a production-grade real-time edge AI runtime built for low-power deployment.
 
-### 单摄像头
+It combines YOLOv8-Pose for human pose estimation, ByteTrack for multi-object tracking, a four-path fall detection algorithm, ONNX Runtime backend, and a full fault-tolerant Runtime Engine into a single optimized pipeline running entirely on local hardware at real-time speeds.
+
+Designed for scenarios where cloud dependency, latency, or subscription cost is unacceptable:
+
+- **Elderly Care** — real-time fall detection, nursing home monitoring
+- **Smart Hospital** — patient movement monitoring, bed-exit alerts
+- **Home Security** — lone worker safety, in-home fall alerts
+- **Edge AI Research** — multi-backend inference benchmarking, runtime fault tolerance
+- **AI Monitoring Platform** — SDK for integration with face recognition / fire detection / behavior analysis
+
+---
+
+## Demo
 
 ```
-摄像头 → YOLOv8-Pose (17关键点) → ByteTracker 跟踪
-    → 四路跌倒检测:
-        路径1: 宽高比 + 髋部角度 (AND)
-        路径2: 旋转能量 / 重力因子 / 头部下降 (需几何确认)
-        路径3: AR剧变 + 头部下降 (侧倒)
-        路径4: 已在地面检测
-    → 滑动窗口(20帧, 50%) → 连续触发(5帧) → 持续时间(3.5秒) → 显示
+┌──────────────────────────────────────────────────────────────┐
+│ FPS: 29.0    Backend: ultralytics    Device: cpu             │
+│ Persons: 2    Inference: True                                │
+│                                                              │
+│   ┌─────────────┐    ┌─────────────┐                         │
+│   │  ID:1       │    │  ID:2       │                         │
+│   │  FALL       │    │  NORMAL     │                         │
+│   │  (0.60)     │    │  (0.00)     │                         │
+│   └─────────────┘    └─────────────┘                         │
+│                                                              │
+│   !! FALL DETECTED !!                                        │
+│   Press ESC to quit                                          │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### 双摄像头
+### Run Modes
 
-```
-摄像头A → 进程A: YOLO检测 + 跟踪 + 直方图 + 角度关键点 ──→ Queue ──┐
-                                                                      ├──→ 主进程:
-摄像头B → 进程B: YOLO检测 + 跟踪 + 直方图 + 角度关键点 ──→ Queue ──┘
-                                                                     ├─ 稳定婚姻匹配
-                                                                     ├─ fall_state 持久化
-                                                                     ├─ 四路跌倒判断
-                                                                     ├─ 双视角交叉验证
-                                                                     └─ 拼接显示
+```bash
+python main.py                          # Demo mode (GUI window)
+python main.py --edge                   # Edge mode (320px, interval=2)
+python main.py --headless               # Headless mode (JSON output)
+python main.py --edge --headless        # Edge + Headless combo
+python main.py --num_cams 2 --cam_ids 0 1  # Dual camera
 ```
 
-## 安装
+---
+
+## Features
+
+### Core Detection Pipeline
+
+- [x] **YOLOv8-Pose** — 17-keypoint human pose estimation via Ultralytics
+- [x] **ByteTrack Tracking** — Kalman filter + cascade matching, stable IDs
+- [x] **Ghost Target System** — lost tracks preserved with fall-state inheritance
+- [x] **ROI Secondary Inference** — low-confidence re-detection on potential falls
+- [x] **Adaptive Frame Scheduler** — `inference_interval` to skip frames on low-power devices
+- [x] **Multi-Person Limiting** — `max_persons` to cap tracked targets
+
+### Fall Detection Logic
+
+- [x] **Four-Path Detection** — Geometry (AR+angle), Physics (RE/GF), Side-fall (AR+head descent), Already-down
+- [x] **Sliding Window** — 20-frame trigger ratio (50%), 5-frame consecutive trigger
+- [x] **Duration Confirmation** — 3.5s persistence before confirmed fall
+- [x] **Rebound Detection** — head rebound 15% body height + 2 frames → cancel fall
+- [x] **State Stickiness** — confirmed fall persists through signal loss
+- [x] **Recovery Detection** — AR recovery to 70% baseline auto-reset
+- [x] **Fast Channel** — high-confidence (RE>15, GF>15000, angle<120) skip duration
+
+### Physical Features
+
+- [x] **Rotational Energy (RE)** — inverted pendulum model, frame-rate normalized (rad/s)
+- [x] **Gravity Factor (GF)** — center-of-gravity acceleration toward ground (pixel/s²)
+- [x] **Head Descent (HD)** — long-term head drop relative to body height
+- [x] **EMA + Savitzky-Golay** — dual smoothing for noise reduction
+- [x] **Torso Inclination** — hip→shoulder vector angle, monitoring-view adaptive
+
+### Dual Camera
+
+- [x] **Multi-Process Architecture** — independent camera processes via Queue
+- [x] **HSV Histogram Matching** — upper-body color histogram for cross-camera person matching
+- [x] **Stable Marriage Algorithm** — Gale-Shapley global optimal matching
+- [x] **Dual Confirmation** — both cameras confirm fall → 95% confidence, single → 60%
+
+### Reasoning Backends
+
+- [x] **Ultralytics Backend** — native YOLOv8-Pose + ByteTrack, full PyTorch
+- [x] **ONNX Runtime Backend** — zero PyTorch dependency, CPU/CUDA providers
+- [x] **Backend Factory** — `create_backend()` one-click switch (ultralytics / onnx)
+- [x] **Reserved**: OpenVINO / NCNN / TensorRT
+
+### AI Runtime Core
+
+- [x] **Pure Object Pipeline** — Detection → TrackState → Event, 100% dataclass, zero dict leak
+- [x] **Data Models** — Detection / Keypoint / TrackState / Event / FrameContext
+- [x] **DetectionPipeline** — unified orchestrator (6-stage: infer→Detect→Track→Fall→Event→Serialize)
+- [x] **EventRuntime** — event generation with cooldown dedup (fall_confirmed / fall_warning / person_detected)
+- [x] **Serializers** — single object→dict export point, JSON-friendly, zero numpy leak
+- [x] **Validators** — bbox length / score range / event_type forced at stage entry
+
+### Fault-Tolerant Runtime Engine
+
+- [x] **RuntimeStateMachine** — 11 states (INITIALIZING→WARMING_UP→RUNNING→DEGRADED→BACKPRESSURE→OVERLOADED→RECOVERING→RESTARTING→STOPPING→STOPPED→FAILED)
+- [x] **RuntimePolicy** — overload / reconnect / frame drop / cooldown / retry / restart / degradation policies
+- [x] **BackpressureController** — auto frame drop / queue trim / FPS reduction on overload
+- [x] **DegradationController** — 5-level auto degradation (normal→reduce_fps→reduce_res→disable_vis→minimal)
+- [x] **FaultRecovery** — backend restart / worker restart / camera reconnect / session recovery
+- [x] **ResourceManager** — CPU / RAM / queue / thermal real-time monitoring
+- [x] **RuntimeScheduler** — task registration, interval control, priority scheduling, resource-aware
+- [x] **RuntimeWorker** — queue-based isolation, graceful shutdown, heartbeat, exception boundary
+- [x] **RuntimeLifecycleManager** — start / stop / pause / resume / restart with hook system
+- [x] **RuntimeRegistry** — global sessions / cameras / pipelines / workers / backends registration
+- [x] **RuntimeHealthMonitor** — FPS / latency / dropped frames / memory / errors → EventBus
+- [x] **RuntimeMetrics** — Prometheus-ready metrics (frame time, inference count, event count, track count)
+- [x] **RuntimeClock** — unified time domain for multi-camera / multi-model
+- [x] **RuntimeDiagnostics** — unified diagnostics snapshot (state / CPU / RAM / FPS / recovery)
+- [x] **EventBus** — publish/subscribe/broadcast, future WebSocket/MQTT/Kafka ready
+- [x] **RuntimeSignals** — EventSignal / HealthSignal / ErrorSignal / LifecycleSignal / CameraSignal
+- [x] **SharedFrameBuffer** — ring buffer + reference counting, future multi-model frame ownership
+- [x] **CameraSession** — unified camera lifecycle (connect/disconnect/reconnect), USB/RTSP/video ready
+
+### Standard Interface
+
+- [x] **FallDetector SDK** — `from fall_detection import FallDetector`
+- [x] **process_frame()** — single frame in, JSON-friendly dict out
+- [x] **Headless Mode** — no cv2.imshow, structured result printing
+- [x] **inference_interval** — frame skipping for low-power devices
+- [x] **max_persons** — cap tracked targets
+- [x] **enable_visualization** — optional annotated_frame in result
+- [x] **enable_roi** — optional ROI secondary inference
+- [x] **external_tracks** — reserved param for unified tracker integration
+
+### Tools & Tests
+
+- [x] **227/227 Tests** — 10 test modules, zero camera/GPU/model-download dependencies
+- [x] **export_onnx.py** — PT → ONNX model export (opset, dynamic, simplify)
+- [x] **benchmark_backend.py** — multi-backend FPS/latency/memory comparison
+- [x] **check_runtime_purity.py** — auto-scan runtime code for dict leak / numpy leak
+- [x] **runtime_chaos_test.py** — chaos injection (camera disconnect / CPU spike / queue overflow / backend crash)
+- [x] **YAML Configuration** — all tunable parameters in `config.yaml`
+- [x] **Edge Defaults** — pre-configured low-power profile (`input_size=320, interval=2, max_persons=3`)
+
+---
+
+## System Architecture
+
+### Single-Camera Runtime Pipeline
+
+```
+┌────────────────────── Main Process ──────────────────────┐
+│                                                          │
+│  Frame ──▶ Backend.infer() ──▶ Detection                 │
+│  (cv2)    (YOLO/ONNX)         (dataclass)                │
+│                                         │                 │
+│                                         ▼                 │
+│                              Tracking.update()           │
+│                              (IoU matching + ghost)      │
+│                                         │                 │
+│                                         ▼                 │
+│                              TrackState                  │
+│                              (dataclass)                 │
+│                                         │                 │
+│                                         ▼                 │
+│                              evaluate_fall()             │
+│                              (4-path logic)              │
+│                                         │                 │
+│                                         ▼                 │
+│                              EventRuntime                │
+│                              (cooldown + dedup)          │
+│                                         │                 │
+│                                         ▼                 │
+│                                       Event               │
+│                              (dataclass)                 │
+│                                         │                 │
+│                                         ▼                 │
+│                              Serializers                 │
+│                              (single JSON export)        │
+│                                         │                 │
+│                                         ▼                 │
+│                              process_frame()             │
+│                              (JSON-friendly dict)        │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Tech per stage:**
+
+| Stage | Technology | Dependency |
+|-------|-----------|------------|
+| Capture | OpenCV VideoCapture | `opencv-python` |
+| Infer | YOLOv8-Pose (Ultralytics) or ONNX Runtime | `ultralytics` or `onnxruntime` |
+| Track | ByteTrack (Kalman + cascade) + ghost mechanism | `ultralytics` |
+| Detect | Four-path fall logic (geo + physics + side-fall + already-down) | `numpy` + `scipy` |
+| Event | EventRuntime (cooldown dedup) | (stdlib) |
+| Serialize | Serializers (dataclass → dict) | `numpy` |
+| Render | OpenCV draw (skeleton + bbox + alert) | `opencv-python` |
+
+### Runtime Engine Architecture
+
+```
+RuntimeEngine (global)
+  ├── EventBus (global)
+  │     └── subscribe / publish / broadcast
+  ├── RuntimeRegistry
+  │     ├── sessions
+  │     ├── cameras
+  │     ├── pipelines
+  │     └── backends
+  │
+  ├── RuntimeSession (per session)
+  │     ├── RuntimeStateMachine (11-state transitions)
+  │     ├── RuntimePolicy (overload / reconnect / degradation)
+  │     ├── BackpressureController (frame drop / queue trim)
+  │     ├── DegradationController (5-level auto)
+  │     ├── FaultRecovery (auto-restart)
+  │     ├── RuntimeScheduler (task frequency + priority)
+  │     ├── RuntimeWorker (queue-based isolation)
+  │     ├── ResourceManager (CPU / RAM / queue)
+  │     ├── RuntimeHealthMonitor (→ EventBus)
+  │     ├── RuntimeMetrics (Prometheus-ready)
+  │     ├── RuntimeClock (unified time)
+  │     └── DetectionPipeline (6-stage)
+  │
+  └── CameraSession (per camera)
+        ├── connect / disconnect / reconnect
+        └── SharedFrameBuffer (ring buffer + ref counting)
+```
+
+### Multi-Backend Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   Backend Factory                            │
+│  backend = create_backend("ultralytics" | "onnx")           │
+│                                                              │
+│  ┌─────────────────────┐  ┌─────────────────────┐           │
+│  │ UltralyticsBackend  │  │    ONNXBackend      │           │
+│  │ ├─ YOLO.track()     │  │ ├─ ort.Inference    │           │
+│  │ ├─ ByteTrack        │  │ ├─ CPU/CUDA         │           │
+│  │ ├─ PyTorch          │  │ ├─ Zero PyTorch     │           │
+│  │ └─ Results→Detection│  │ └─ Raw→Detection    │           │
+│  └─────────────────────┘  └─────────────────────┘           │
+│                                                              │
+│  Reserved: OpenVINO / NCNN / TensorRT                       │
+└──────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+                  list[Detection]
+                  (unified schema)
+```
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Pure object pipeline (no dict) | Type safety, validation at stage entry, future async-safe |
+| Backend abstraction layer | One-click switch between ultralytics / ONNX / future backends |
+| EventBus broadcast (not direct return) | Future WebSocket / MQTT / Kafka can subscribe directly |
+| StateMachine with illegal transition reject | Runtime self-healing, chaos-resistance |
+| Scheduler-driven (not direct call) | Different pipelines at different FPS, multi-model ready |
+| Worker isolation with exception boundary | One worker crash won't take down entire runtime |
+| SharedFrameBuffer with ref counting | Zero-copy design, future multi-model frame ownership |
+| Single serialization export point | No dict leak into runtime, JSON-friendly guaranteed |
+| Validators at stage entry | Reject invalid objects immediately, no silent conversion |
+| Session-oriented (not global state) | Multi-camera isolation, per-session lifecycle |
+
+---
+
+## Tech Stack
+
+| Layer | Technology | Version | Role |
+|-------|-----------|---------|------|
+| Pose Detection | YOLOv8-Pose (nano) | 8.x | 17-keypoint pose estimation |
+| Object Tracking | ByteTrack (Ultralytics) | 8.x | Kalman filter + cascade matching |
+| Fall Detection | Custom 4-path logic | — | Geometry + Physics + Side-fall + Already-down |
+| Physical Features | EMA + Savitzky-Golay | — | RE / GF / HD with dual smoothing |
+| Cross-Camera Match | HSV Histogram + Hungarian | — | Upper-body color matching |
+| ONNX Inference | ONNX Runtime | ≥ 1.14 | CPU/CUDA backend for edge deployment |
+| Image Processing | OpenCV | ≥ 4.8 | Capture, display, drawing |
+| Config | YAML | ≥ 6.0 | All parameters in config.yaml |
+| Language | Python | 3.12 | Application logic |
+
+---
+
+## Project Structure
+
+```
+project/
+│
+├── main.py                              # Entry point (4 modes: demo/edge/headless/dual)
+├── config.yaml                          # All tunable parameters (thresholds, windows, timeouts)
+├── config.py                            # YAML config loader
+├── requirements.txt                     # Dependencies
+├── README.md                            # This document
+│
+├── fall_detection/                      # Standard SDK (external importable)
+│   ├── __init__.py
+│   ├── detector.py                      # FallDetector class (orchestration only)
+│   ├── schemas.py                       # Output format + JSON serialization
+│   ├── visualizer.py                    # Drawing functions (optional)
+│   ├── edge_config.py                   # Edge device defaults (320px, interval=2)
+│   │
+│   ├── backends/                        # Inference backend abstraction
+│   │   ├── base.py                      # BaseInferenceBackend ABC
+│   │   ├── ultralytics_backend.py       # Ultralytics YOLO backend
+│   │   ├── onnx_backend.py              # ONNX Runtime backend
+│   │   ├── postprocess.py               # Unified postprocessing (Detection output)
+│   │   └── factory.py                   # create_backend() factory
+│   │
+│   ├── core/                            # AI Monitoring Runtime Core
+│   │   ├── detection.py                 # Detection / Keypoint dataclass
+│   │   ├── track.py                     # TrackState dataclass
+│   │   ├── event.py                     # Event dataclass
+│   │   ├── frame.py                     # FrameContext dataclass
+│   │   ├── types.py                     # DetectionList / TrackList / EventList
+│   │   ├── pipeline.py                  # DetectionPipeline (6-stage orchestrator)
+│   │   ├── runtime.py                   # EventRuntime (cooldown + dedup)
+│   │   ├── serializers.py              # Single object→dict export point
+│   │   └── validators.py               # Stage-entry validation
+│   │
+│   ├── engine/                          # Runtime Engine
+│   │   ├── runtime_engine.py            # RuntimeEngine entrypoint
+│   │   ├── runtime_session.py           # RuntimeSession (unified state)
+│   │   ├── camera_session.py            # CameraSession (lifecycle)
+│   │   ├── frame_buffer.py              # SharedFrameBuffer (ring buffer)
+│   │   ├── scheduler.py                 # RuntimeScheduler (task frequency)
+│   │   ├── worker.py                    # RuntimeWorker (queue isolation)
+│   │   ├── event_bus.py                 # EventBus (pub/sub)
+│   │   ├── lifecycle.py                 # RuntimeLifecycleManager
+│   │   ├── registry.py                  # RuntimeRegistry
+│   │   ├── health.py                    # RuntimeHealthMonitor
+│   │   ├── metrics.py                   # RuntimeMetrics
+│   │   ├── resource_manager.py          # ResourceManager (CPU/RAM/queue)
+│   │   ├── time_sync.py                 # RuntimeClock (unified time)
+│   │   ├── diagnostics.py              # RuntimeDiagnostics
+│   │   └── signals.py                   # RuntimeSignals
+│   │
+│   └── runtime_state/                   # Fault-Tolerant State Management
+│       ├── state_machine.py             # RuntimeStateMachine (11 states)
+│       ├── policies.py                  # RuntimePolicy
+│       ├── backpressure.py              # BackpressureController
+│       ├── degradation.py               # DegradationController (5-level)
+│       ├── recovery.py                  # FaultRecovery
+│       └── transitions.py               # State helpers
+│
+├── tools/                               # Development tools
+│   ├── export_onnx.py                   # PT → ONNX export
+│   ├── benchmark_backend.py             # Backend performance comparison
+│   ├── check_runtime_purity.py          # Runtime purity scanner
+│   └── runtime_chaos_test.py            # Chaos injection testing
+│
+├── docs/                                # Documentation
+│   ├── runtime_architecture.md          # Runtime Flow architecture
+│   └── runtime_engine.md                # Runtime Engine architecture
+│
+├── tests/                               # 227 tests across 10 modules
+│   ├── test_fall_detection.py           # 13 fall scenario tests
+│   ├── test_features.py                 # 33 feature computation tests
+│   ├── test_tracking.py                 # 12 tracker tests
+│   ├── test_cross_camera.py             # 19 cross-camera match tests
+│   ├── test_detector_interface.py       # 45 FallDetector SDK tests
+│   ├── test_backends.py                 # 22 backend tests
+│   ├── test_runtime_pipeline.py         # 19 pipeline tests
+│   ├── test_runtime_integrity.py        # 17 integrity tests
+│   ├── test_runtime_engine.py           # 28 engine component tests
+│   └── test_runtime_fault_tolerance.py  # 19 fault tolerance tests
+│
+├── fall_logic.py                        # Core fall detection algorithm (469 lines)
+├── features.py                          # Physical feature computation
+├── tracking.py                          # Pure Runtime tracker (Detection→TrackState)
+├── camera_process.py                    # Multi-process camera handling
+└── cross_camera.py                      # Cross-camera person matching
+```
+
+---
+
+## Installation
+
+### Prerequisites
+
+| Software | Version | Check | Required For |
+|----------|---------|-------|-------------|
+| Python | 3.8+ | `python --version` | All profiles |
+| OpenCV | 4.8+ | `pip show opencv-python` | Camera capture + rendering |
+| Ultralytics | 8.0+ | `pip show ultralytics` | Ultralytics backend |
+| ONNX Runtime | 1.14+ | `pip show onnxruntime` | ONNX backend (edge) |
+| SciPy | 1.10+ | `pip show scipy` | SG filter smoothing |
+| PyYAML | 6.0+ | `pip show pyyaml` | Config loading |
+| lap | 0.4+ | `pip show lap` | ByteTrack backend |
+
+### Step-by-Step
+
+**1. Clone**
 
 ```bash
 git clone https://github.com/Macchiato-7782/-YOLOv8-Pose-.git
 cd -YOLOv8-Pose-
-python3 -m venv venv
-source venv/bin/activate
+```
+
+**2. Install dependencies**
+
+```bash
 pip install -r requirements.txt
 ```
 
-## 运行
+**3. Download model**
+
+Model auto-downloads on first run, or manually:
 
 ```bash
-# 单摄像头（Demo 模式）
-python main.py
-
-# 单视频文件
-python main.py --video your_video.mp4
-
-# 双摄像头
-python main.py --num_cams 2 --cam_ids 0 1
-
-# 双视频文件
-python main.py --num_cams 2 --video cam1.mp4 cam2.mp4
-
-# Headless 模式（无窗口，打印结构化结果）
-python main.py --headless
-
-# 边缘设备低功耗模式
-python main.py --edge
-
-# 边缘 + Headless 组合
-python main.py --edge --headless
-
-# 保存输出视频
-python main.py --num_cams 2 --cam_ids 0 1 --save_output
+# Download yolov8n-pose.pt (~6.5MB)
+# Place in project root
 ```
 
-按 ESC 退出。
-
-## 测试
-
-不依赖摄像头，用合成数据验证检测逻辑：
+**4. Run tests**
 
 ```bash
-# 运行全部测试（227 个用例）
-python -m pytest test_fall_detection.py test_features.py test_tracking.py test_cross_camera.py test_detector_interface.py test_backends.py test_runtime_pipeline.py test_runtime_integrity.py test_runtime_engine.py -v
-
-# 只运行跌倒场景测试
-python -m pytest test_fall_detection.py -v
-
-# 只运行接口测试
-python -m pytest test_detector_interface.py -v
-
-# 只运行后端测试
-python -m pytest test_backends.py -v
-
-# 只运行 Runtime 完整性测试
-python -m pytest test_runtime_integrity.py -v
+python -m pytest test_*.py -q
 ```
 
-覆盖 10 个测试模块、227 个用例。
+Expected: `227 passed`
 
-## 跌倒判断逻辑
+**5. Run**
 
-### 四路检测（任一触发即为"可能跌倒"）
+```bash
+python main.py                     # Demo (GUI)
+python main.py --edge              # Edge mode (low-power)
+python main.py --headless          # Headless (JSON)
+```
 
-| 路径 | 条件 | 适用场景 |
-|------|------|----------|
-| 路径1: 几何 | AR/初始AR < 0.35 **且** 角度 < 120° | 前倒/后倒 |
-| 路径2: 物理 | (RE > 8 **或** GF > 8000) **且** (AR变化 > 10% **或** 头部下降) | 快速摔倒/蜷缩倒 |
-| 路径3: 侧倒 | AR 剧变 **且** 头部下降 | 侧倒（角度不够低） |
-| 路径4: 地面 | 初始AR低 **且** 当前AR < 0.4 **且** 持续10帧 | 已在地上的人 |
+---
 
-### 确认机制
+## Usage
 
-- 滑动窗口：20 帧内 50% 触发
-- 连续触发：至少 5 帧连续触发（允许 1 帧间隙）
-- 持续时间：3.5 秒
-- 回弹检测：头部回升 15% 身高 + 连续 2 帧 → 取消跌倒判定
-- 状态粘性：确认后不因信号消失而重置
-- 恢复检测：AR 回升到基线 70% 自动重置
+### Start
 
-### 物理特征（来自 HumanFallDetection）
+```bash
+python main.py                              # Single camera demo
+python main.py --edge                       # Edge low-power mode
+python main.py --headless                   # Headless (JSON output)
+python main.py --edge --headless            # Edge + Headless
+python main.py --video your_video.mp4       # Video file
+python main.py --num_cams 2 --cam_ids 0 1   # Dual camera
+python main.py --save_output                # Save video
+python main.py --debug                      # Debug logging
+```
 
-| 特征 | 含义 |
-|------|------|
-| 旋转能量 (RE) | 倒立摆模型，身体绕脚旋转的角速度 |
-| 重力因子 (GF) | 重心加速度方向与重力的一致性 |
-| 头部下降 (HD) | 头部下降量 / 身高 |
+### Key Controls
 
-### 双摄像头交叉验证
+| Key | Action |
+|-----|--------|
+| `ESC` | Quit (demo mode) |
+| `Ctrl+C` | Quit (headless mode) |
 
-- 两个摄像头都确认跌倒 → 高置信度 (95%)
-- 只有一个确认 → 低置信度警告 (60%)
-
-## 跨摄像头人物匹配
-
-1. 对每个人计算上半身 HSV 颜色直方图作为"外貌特征"
-2. 计算两个摄像头中所有未匹配人之间的直方图相关性矩阵
-3. 用**稳定婚姻算法**（Gale-Shapley）做全局最优匹配
-4. 定期检查已匹配对的相关性，低于阈值则拆开重新匹配
-
-## 参数说明
-
-| 参数 | 默认值 | 含义 |
-|------|--------|------|
-| `--model` | yolov8n-pose.pt | YOLO 模型路径 |
-| `--num_cams` | 1 | 摄像头数量 |
-| `--cam_ids` | 0 | 摄像头 ID |
-| `--video` | None | 视频文件路径 |
-| `--save_output` | False | 保存输出视频 |
-| `--debug` | False | 启用调试日志 |
-| `--headless` | False | 无窗口模式，打印结构化结果 |
-| `--edge` | False | 边缘设备低功耗模式 |
-
-## 依赖
-
-- Python 3.8+
-- opencv-python >= 4.8.0
-- numpy >= 1.24.0
-- ultralytics >= 8.0.0
-- scipy >= 1.10.0
-- pyyaml >= 6.0
-- lap >= 0.4.0 (ByteTracker 后端)
-
-## macOS 注意事项
-
-首次使用摄像头需要授权：系统设置 → 隐私与安全性 → 摄像头 → 打开"终端"。
-
-## 作为模块接入其他项目
-
-### 标准接口
+### SDK Usage
 
 ```python
 from fall_detection import FallDetector
@@ -186,156 +481,99 @@ detector = FallDetector(
     device="cpu",
     input_size=320,
     inference_interval=2,
-    enable_roi=False,
     enable_visualization=False,
 )
 
 cap = cv2.VideoCapture(0)
-
 while True:
     ret, frame = cap.read()
     if not ret:
         break
-
-    result = detector.process_frame(
-        frame,
-        camera_id="cam_0"
-    )
-
+    result = detector.process_frame(frame, camera_id="cam_0")
     for event in result["events"]:
         if event["event_type"] == "fall_confirmed":
-            print("Fall detected:", event)
+            print(f"Fall detected: track={event['track_id']} conf={event['confidence']:.2f}")
 
 cap.release()
 detector.close()
 ```
 
-### 输出格式
-
-```json
-{
-    "module": "fall_detection",
-    "camera_id": "cam_0",
-    "timestamp": 1710000000.0,
-    "frame_id": 12,
-    "persons": [
-        {
-            "track_id": 1,
-            "bbox": [100, 200, 300, 500],
-            "center": [200, 350],
-            "state": "fall",
-            "fall_detected": true,
-            "confidence": 0.6,
-            "is_ghost": false,
-            "keypoints": [[100.0, 200.0, 0.9], ...]
-        }
-    ],
-    "events": [
-        {
-            "event_type": "fall_confirmed",
-            "track_id": 1,
-            "camera_id": "cam_0",
-            "timestamp": 1710000000.0,
-            "confidence": 0.6,
-            "bbox": [100, 200, 300, 500],
-            "state": "fall"
-        }
-    ],
-    "diagnostics": {
-        "fps": 15.2,
-        "backend": "ultralytics",
-        "device": "cpu",
-        "inference_ran": true
-    }
-}
-```
-
-所有字段均可 `json.dumps` 序列化。`numpy` 类型已自动转换为 Python 原生类型。
-
-### FallDetector 参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `model_path` | str | yolov8n-pose.pt | 模型文件路径 |
-| `config_path` | str | config.yaml | 配置文件路径 |
-| `device` | str | "cpu" | 推理设备 |
-| `backend` | str | "ultralytics" | 推理后端（预留 onnx/openvino/ncnn） |
-| `enable_tracking` | bool | True | 启用 ByteTracker |
-| `enable_visualization` | bool | False | 在结果中附加标注图像 |
-| `enable_roi` | bool | False | 启用 ROI 二次推理 |
-| `inference_interval` | int | 1 | 每 N 帧推理一次 |
-| `input_size` | int | 640 | 模型输入分辨率 |
-| `max_persons` | int | None | 最多跟踪人数 |
-
-### Headless 模式
+### ONNX Backend
 
 ```bash
-# 不显示窗口，打印结构化结果
-python main.py --headless
-
-# 边缘设备低功耗模式
-python main.py --edge --headless
-```
-
-## 边缘设备建议配置
-
-| 设备 | input_size | inference_interval | enable_roi | max_persons |
-|------|-----------|-------------------|------------|-------------|
-| 树莓派 4B | 320 | 2 | False | 1-2 |
-| NVIDIA Jetson Nano | 320 | 1 | False | 2-3 |
-| Intel NUC / 普通 PC | 640 | 1 | True | None |
-
-边缘设备初始化示例：
-
-```python
-detector = FallDetector(
-    model_path="yolov8n-pose.pt",
-    device="cpu",
-    input_size=320,
-    inference_interval=2,
-    enable_roi=False,
-    enable_visualization=False,
-    max_persons=3,
-)
-```
-
-后续计划扩展 ONNX / OpenVINO / NCNN 后端，只需切换 `backend` 参数即可。
-
-## 推理后端
-
-支持多种推理后端，通过 `backend` 参数切换。
-
-| 后端 | 参数值 | 依赖 | 适合场景 |
-|------|--------|------|----------|
-| Ultralytics | `"ultralytics"` | ultralytics + PyTorch | 开发调试、GPU 服务器 |
-| ONNX Runtime | `"onnx"` | onnxruntime | 边缘设备、低功耗部署 |
-| OpenVINO | `"openvino"` | (预留) | Intel CPU/VPU |
-| NCNN | `"ncnn"` | (预留) | ARM Linux / Android |
-
-### 使用 ONNX 后端
-
-```bash
-# 1. 导出 ONNX 模型
+# 1. Export model
 python tools/export_onnx.py
 
-# 2. 使用 ONNX 后端
-from fall_detection import FallDetector
-
-detector = FallDetector(
-    backend="onnx",
-    model_path="yolov8n-pose.onnx",
-    device="cpu",
-    input_size=320,
-)
+# 2. Run with ONNX backend
+python main.py --headless --model yolov8n-pose.onnx
 ```
 
-### Benchmark 工具
+### Benchmark
 
 ```bash
 python tools/benchmark_backend.py
 ```
 
-输出示例：
+---
+
+## Configuration
+
+### Parameters
+
+All settings in `config.yaml`:
+
+```yaml
+fall_logic:
+  horizontal_ar_threshold: 0.6       # AR < this = horizontal
+  angle_threshold: 120               # Hip angle (stand~180°, fall<120°)
+  torso_inclination_threshold: 55    # Torso vector angle (stand~0°, fall>70°)
+  min_fall_pose_duration: 3.5        # Must persist 3.5s to confirm
+  re_threshold: 8                    # Rotational energy rad/s
+  gf_threshold: 8000                 # Gravity factor pixel/s²
+  window_size: 20                    # Sliding window size
+  window_trigger_ratio: 0.5          # 50% trigger in window
+  min_consecutive_triggers: 5        # Consecutive frames
+
+tracking:
+  ghost_timeout: 3.0                 # Normal ghost timeout
+  ghost_timeout_fallen: 5.0          # Fallen ghost timeout (extended)
+  history_length: 36                 # Keypoint history buffer
+
+edge_config:
+  input_size: 320                    # Edge default input size
+  inference_interval: 2              # Skip every other frame
+  enable_roi: false                  # Disable ROI on edge
+  enable_visualization: false        # No annotated_frame on edge
+  max_persons: 3                     # Limit tracked persons
+```
+
+### Edge Deployment Defaults
+
+```python
+detector = FallDetector(
+    input_size=320,           # Reduce resolution
+    inference_interval=2,      # Skip frames
+    enable_roi=False,          # Disable ROI
+    enable_visualization=False,# No annotated frame
+    max_persons=3,            # Limit tracking
+)
+```
+
+### Quick Tuning
+
+| Goal | Settings |
+|------|----------|
+| Maximum FPS | `input_size=320, inference_interval=3` |
+| Best Accuracy | `input_size=640, inference_interval=1, enable_roi=True` |
+| Low CPU | `input_size=320, inference_interval=3, max_persons=2` |
+| Reduced False Alarms | Increase `min_fall_pose_duration` to 5.0 |
+| Faster Fall Detection | Decrease `min_fall_pose_duration` to 2.0, increase `window_trigger_ratio` |
+
+---
+
+## Performance
+
+### Backend Comparison
 
 ```
 ==================================================
@@ -358,240 +596,200 @@ ONNX vs Ultralytics:
 ==================================================
 ```
 
-## 项目结构
+### Chaos Test
 
 ```
-├── main.py                     # 入口，支持单/双摄像头模式 + --headless + --edge
-├── fall_detection/             # 标准检测模块（可被外部 import）
-│   ├── __init__.py
-│   ├── detector.py             # FallDetector 标准接口（orchestration only）
-│   ├── schemas.py              # 输出格式定义与 JSON 序列化
-│   ├── visualizer.py           # 绘图函数（draw_person_info 等）
-│   ├── edge_config.py          # 边缘设备默认参数
-│   ├── backends/               # 推理后端抽象层
-│   │   ├── __init__.py
-│   │   ├── base.py             # BaseInferenceBackend 抽象类
-│   │   ├── ultralytics_backend.py  # Ultralytics YOLO 后端
-│   │   ├── onnx_backend.py     # ONNX Runtime 后端
-│   │   ├── postprocess.py      # 统一后处理
-│   │   └── factory.py          # create_backend() 工厂
-│   └── core/                   # AI Monitoring Runtime Core
-│       ├── __init__.py
-│       ├── detection.py        # Detection / Keypoint dataclass
-│       ├── track.py            # TrackState dataclass
-│       ├── event.py            # Event dataclass
-│       ├── frame.py            # FrameContext dataclass
-│       ├── pipeline.py         # DetectionPipeline 统一编排
-│       ├── runtime.py          # EventRuntime 事件生成+去重
-│       ├── serializers.py      # dataclass → JSON-friendly
-│       └── validators.py       # 结构校验
-│   └── engine/                 # Runtime Engine
-│       ├── __init__.py
-│       ├── runtime_engine.py   # RuntimeEngine 入口
-│       ├── runtime_session.py  # RuntimeSession 状态管理
-│       ├── camera_session.py   # CameraSession 生命周期
-│       ├── frame_buffer.py     # SharedFrameBuffer
-│       ├── scheduler.py        # RuntimeScheduler
-│       ├── worker.py           # RuntimeWorker
-│       ├── event_bus.py        # EventBus 事件总线
-│       ├── signals.py          # RuntimeSignals
-│       ├── lifecycle.py        # LifecycleManager
-│       ├── registry.py         # RuntimeRegistry
-│       ├── health.py           # HealthMonitor
-│       └── metrics.py          # RuntimeMetrics
-├── tools/                      # 开发工具
-│   ├── export_onnx.py          # PT → ONNX 导出
-│   ├── benchmark_backend.py    # 后端性能对比
-│   └── check_runtime_purity.py # Runtime 纯度检查
-├── docs/                       # 文档
-│   ├── runtime_architecture.md # Runtime Flow 架构
-│   └── runtime_engine.md       # Runtime Engine 架构
-├── fall_logic.py               # 融合跌倒判断逻辑（四路检测 + 滑动窗口）
-├── features.py                 # 物理特征计算（旋转能量、重力因子、头部下降）
-├── tracking.py                 # ByteTracker 跟踪 + 幽灵机制 + 跌倒状态继承
-├── cross_camera.py             # 跨摄像头匹配（直方图 + 稳定婚姻算法）
-├── camera_process.py           # 摄像头处理进程（多进程架构）
-├── config.py                   # 配置加载器
-├── config.yaml                 # 所有可调参数（阈值、窗口、超时等）
-├── test_fall_detection.py      # 跌倒场景测试
-├── test_features.py            # 物理特征测试
-├── test_tracking.py            # 跟踪器测试
-├── test_cross_camera.py        # 跨摄像头匹配测试
-├── test_detector_interface.py  # FallDetector 接口测试
-├── test_backends.py            # 推理后端测试
-├── test_runtime_pipeline.py    # Runtime Pipeline 测试
-├── test_runtime_integrity.py   # Runtime 完整性测试
-├── test_runtime_engine.py      # Runtime Engine 测试
-├── requirements.txt            # 依赖清单
-└── README.md
+==================================================
+Chaos Test Report
+==================================================
+Recovered Crashes:    1
+Dropped Frames:       3
+Recovered Workers:    1
+Runtime Restart Count:0
+Final Runtime State:  RUNNING
+==================================================
 ```
 
-## 参考
+---
 
-- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics)
-- [HumanFallDetection](https://github.com/taufeeque9/HumanFallDetection) — 双摄像头方案和物理特征
-- [COCO Keypoints](https://cocodataset.org/#keypoints-2017)
+## Test Suite
 
-## 更新日志
+```
+$ python -m pytest test_*.py -q
 
-### 2026-05-14（v3）
+test_fall_detection.py .............                      [  5%]
+test_features.py .................................        [ 19%]
+test_tracking.py ............                             [ 25%]
+test_cross_camera.py ...................                  [ 33%]
+test_detector_interface.py .................................... [ 53%]
+test_backends.py ......................                    [ 63%]
+test_runtime_pipeline.py ...................               [ 71%]
+test_runtime_integrity.py .................                [ 79%]
+test_runtime_engine.py ............................        [ 91%]
+test_runtime_fault_tolerance.py ...................        [100%]
 
-**SDK 化与边缘部署:**
-- 新增 `fall_detection/` 标准检测包，可被外部项目直接 `import` 调用
-- 新增 `FallDetector` 类作为唯一对外接口，返回 JSON-friendly 结构化结果
-- 新增 `schemas.py`：numpy→Python 类型自动转换，`json.dumps` 可直接序列化
-- 新增 `edge_config.py`：边缘设备默认参数（input_size=320, interval=2 等）
-- 新增 `visualizer.py`：从 main.py 迁移绘图函数，可选调用
-- 新增 `--headless` CLI 参数：无窗口模式，打印结构化结果摘要
-- 新增 `--edge` CLI 参数：一键切换低功耗默认配置
-- 核心逻辑支持 headless 模式：不依赖 `cv2.imshow`、`argparse`
-- 预留 `external_tracks` / `backend` 参数，便于后续接入人脸识别项目和 ONNX/OpenVINO 后端
+227 passed in 7.2s
+```
 
-**推理后端抽象层（v3.1）:**
-- 新增 `fall_detection/backends/` 推理后端抽象层
-- 实现 `BaseInferenceBackend` 抽象基类，统一 infer / warmup / close 接口
-- 实现 `UltralyticsBackend`：封装 YOLO.track()，返回统一 detection schema
-- 实现 `ONNXBackend`：基于 onnxruntime，零 PyTorch 依赖，适合边缘设备
-- 实现 `create_backend()` 工厂函数：一键切换 ultralytics / onnx 后端，预留 openvino / ncnn
-- 实现 `postprocess.py`：统一后处理（bbox 解码、NMS、关键点提取）
-- `detector.py` 不再直接 import YOLO，完全 backend 无关
-- `tracking.py` 不再 import ultralytics，新增 IoU 匹配 `_assign_ids()`
-- 新增 `tools/export_onnx.py`：PT → ONNX 模型导出
-- 新增 `tools/benchmark_backend.py`：多后端性能对比工具
-- 新增 `test_detector_interface.py`：45 个接口测试用例
-- 新增 `test_backends.py`：22 个后端测试用例
+---
 
-**AI Monitoring Runtime Core（v3.2）:**
-- 新增 `fall_detection/core/` Runtime Core 模块
-- 实现标准化 Data Model：`Detection` / `Keypoint` / `TrackState` / `Event` / `FrameContext`
-- 实现 `DetectionPipeline`：统一编排 infer → Detection → tracking → TrackState → fall logic → Event → serialize
-- 实现 `EventRuntime`：事件生成 + cooldown 去重 + 防重复
-- 实现 `serializers.py`：dataclass → JSON-friendly dict，零 numpy 泄露
-- 实现 `validators.py`：结构校验（bbox 长度、score 范围、event_type 等）
-- `detector.py` 改为纯 orchestration 层，不直接操作 detection/tracking/events
-- Pipeline 内部统一使用 dataclass objects，最终输出时才 serialize
-- 新增 `docs/runtime_architecture.md`：Runtime Flow 架构文档
-- 新增 `test_runtime_pipeline.py`：数据模型、序列化、校验、Pipeline 兼容性测试
-- 测试覆盖从 53 个增至 **156 个**，全部通过
+## Changelog
 
-**Pure Runtime Refactor（v3.3）:**
-- Runtime 内部彻底禁止 dict：Detection→TrackState→Event 全链路纯对象
-- backend `infer()` 严格返回 `list[Detection]`（含 Keypoint 对象），不再返回 dict
-- tracking.py 输入 `list[Detection]`，输出 `list[TrackState]`，删除 `convert_backend_detections` 等兼容层
-- pipeline.py 纯对象流水线，删除 `_ensure_detections` / isinstance(dict) 等 legacy 适配器
+### v3.5 — Fault-Tolerant Runtime (2026-05-15)
+
+- **新增** `fall_detection/runtime_state/` — 容错运行时状态管理包
+- **实现** `RuntimeStateMachine` — 11 状态 + 非法转换 reject + 状态历史
+- **实现** `RuntimePolicy` — overload / reconnect / frame drop / cooldown / retry / restart / degradation
+- **实现** `BackpressureController` — 自动帧丢弃 / 队列裁剪 / FPS 降级
+- **实现** `DegradationController` — 5 级自动降级 (normal→reduce_fps→reduce_res→disable_vis→minimal)
+- **实现** `FaultRecovery` — backend restart / worker restart / camera reconnect / session recovery
+- **实现** `ResourceManager` — CPU / RAM / queue / thermal 实时监控
+- **实现** `RuntimeClock` — 统一时间域
+- **实现** `RuntimeDiagnostics` — 统一诊断输出
+- **新增** `tools/runtime_chaos_test.py` — Chaos 测试工具
+
+### v3.4 — Runtime Engine (2026-05-15)
+
+- **新增** `fall_detection/engine/` — Runtime Engine 模块 (13 文件)
+- **实现** `RuntimeEngine` — 工业级边缘 AI Runtime 入口
+- **实现** `RuntimeSession` — 统一 Runtime 状态管理
+- **实现** `CameraSession` — 摄像头生命周期管理
+- **实现** `SharedFrameBuffer` — 共享帧缓冲区 (ring buffer + ref counting)
+- **实现** `EventBus` — 统一事件总线 (subscribe/unsubscribe/publish)
+- **实现** `RuntimeScheduler` — 任务调度器
+- **实现** `RuntimeWorker` — Worker 系统 (queue-based isolation)
+- **实现** `RuntimeRegistry` / `RuntimeMetrics` / `RuntimeHealthMonitor`
+
+### v3.3 — Pure Runtime Refactor (2026-05-14)
+
+- Runtime 内部彻底禁止 dict，Detection→TrackState→Event 全链路纯对象
+- backend infer() 严格返回 list[Detection]（含 Keypoint 对象）
+- tracking.py 输入 list[Detection]，输出 list[TrackState]
+- 删除 _ensure_detections / convert_backend_detections 等 legacy 兼容层
 - serializers.py 成为唯一 object→dict 出口
-- validators.py 在 Runtime 入口强制校验
-- 新增 `core/types.py`：DetectionList / TrackList / EventList 类型别名
-- 新增 `tools/check_runtime_purity.py`：自动扫描 Runtime dict leak
-- 新增 `test_runtime_integrity.py`：数据类型完整性测试
-- 测试覆盖增至 **168 个**，全部通过
 
-**Pure Runtime Refactor（v3.3）:**
-- Runtime 内部彻底禁止 dict：Detection→TrackState→Event 全链路纯对象
-- backend `infer()` 严格返回 `list[Detection]`（含 Keypoint 对象）
-- tracking.py 输入 `list[Detection]`，输出 `list[TrackState]`，删除 `convert_backend_detections` 等兼容层
-- pipeline.py 纯对象流水线，删除 `_ensure_detections` / isinstance(dict) 等 legacy 适配器
-- serializers.py 成为唯一 object→dict 出口
-- validators.py 在 Runtime 入口强制校验
-- 新增 `core/types.py`：DetectionList / TrackList / EventList 类型别名
-- 新增 `tools/check_runtime_purity.py`：自动扫描 Runtime dict leak
-- 新增 `test_runtime_integrity.py`：数据类型完整性测试
-- 测试覆盖增至 **174 个**，全部通过
+### v3.2 — Runtime Core (2026-05-14)
 
-**Runtime Engine Architecture（v3.4）:**
-- 新增 `fall_detection/engine/` Runtime Engine 模块
-- 实现 `RuntimeEngine`：工业级边缘 AI Runtime 入口
-- 实现 `RuntimeSession`：统一 Runtime 状态管理（tracking/frame/backend/scheduler/metrics）
-- 实现 `CameraSession`：统一摄像头生命周期（connect/disconnect/reconnect）
-- 实现 `SharedFrameBuffer`：共享帧缓冲区（ring buffer + ref counting）
-- 实现 `EventBus`：统一事件总线（subscribe/unsubscribe/publish）
-- 实现 `RuntimeScheduler`：任务调度器，支持不同 pipeline 不同频率
-- 实现 `RuntimeWorker`：Worker 系统（queue-based, graceful shutdown, exception isolation）
-- 实现 `RuntimeLifecycleManager`：统一 start/stop/pause/resume/restart
-- 实现 `RuntimeRegistry`：全局注册中心（sessions/cameras/pipelines/workers/backends）
-- 实现 `RuntimeHealthMonitor`：健康监控（FPS/latency/memory/errors → EventBus）
-- 实现 `RuntimeMetrics`：Prometheus-ready 指标收集
-- 实现 `RuntimeSignals` 系统：EventSignal / HealthSignal / ErrorSignal / LifecycleSignal
-- 新增 `docs/runtime_engine.md`：Engine Architecture 文档
-- 新增 `test_runtime_engine.py`：Engine 组件测试
-- 测试覆盖增至 **193 个**，全部通过
+- 新增 `fall_detection/core/` — AI Monitoring Runtime Core
+- 实现 Detection / Keypoint / TrackState / Event / FrameContext dataclass
+- 实现 DetectionPipeline — 6 阶段编排器
+- 实现 EventRuntime — 事件生成 + cooldown 去重
 
-**Fault-Tolerant Runtime（v3.5）:**
-- 新增 `fall_detection/runtime_state/` 容错运行时状态管理包
-- 实现 `RuntimeStateMachine`：11 状态 + 非法转换 reject + 状态历史
-- 实现 `RuntimePolicy`：overload / reconnect / frame drop / cooldown / retry 策略
-- 实现 `BackpressureController`：自动帧丢弃 / 队列裁剪 / FPS 降级
-- 实现 `DegradationController`：5 级自动降级
-- 实现 `FaultRecovery`：backend/worker/camera/session 自动恢复
-- 实现 `ResourceManager`：CPU / RAM / queue / thermal 实时监控
-- 实现 `RuntimeClock`：统一时间域
-- 实现 `RuntimeDiagnostics`：统一诊断输出
-- 新增 `tools/runtime_chaos_test.py`：Chaos 测试（camera disconnect / CPU spike / queue overflow）
-- 新增 `test_runtime_fault_tolerance.py`：容错测试
-- 测试覆盖增至 **227 个**，全部通过
+### v3.1 — Backend Abstraction (2026-05-14)
 
-### 2026-05-13（v2）
+- 新增 `fall_detection/backends/` — 推理后端抽象层
+- 实现 UltralyticsBackend / ONNXBackend / BackendFactory
+- detector.py 不再 import YOLO，完全 backend 无关
 
-**跟踪方案升级:**
-- 集成 Ultralytics 内置 ByteTracker（卡尔曼滤波 + 级联匹配），替代手写匈牙利匹配
-- 新增幽灵目标跌倒状态继承：检测框短暂消失后重新出现时，通过 IoU 匹配恢复跌倒状态
-- 依赖新增 `lap` 包（ByteTracker 后端）
+### v3.0 — SDK 化与边缘部署 (2026-05-14)
 
-**物理特征降噪:**
-- 新增 Savitzky-Golay 滤波（二次平滑，保留信号形状）
-- 新增 EMA 指数移动平均（降噪）
-- 帧率归一化：RE 单位 rad/s，GF 单位 pixel/s²
+- 新增 `fall_detection/` 标准检测包
+- 实现 FallDetector 类 + JSON 标准化输出
+- 新增 --headless / --edge CLI 参数
 
-**误报抑制:**
-- 物理路径加几何守卫：RE/GF 触发需配合 AR 变化（>10%）或头部下降，过滤走路/弯腰误报
-- 连续触发要求：5 帧连续触发（允许 1 帧间隙），过滤瞬间动作
-- 滑动窗口：20 帧内 50% 触发
-- 持续时间：3.5 秒（给弯腰恢复留足够时间）
-- 回弹检测门槛降低：头部回升 15% 身高 + 2 帧即可取消跌倒
-- 角度阈值收紧：130° → 120°
-- 物理特征阈值提高：RE 8, GF 8000
+### v2.0 — 跟踪 + 降噪 + 误报抑制 (2026-05-13)
 
-**监控视角适配:**
-- 躯干倾斜角：torso_vec 长度 < 身高 10% 时跳过（俯视视角不可靠）
-- 初始 AR 更新改为滑动最大值（30 帧窗口），弯腰后能恢复基线
-- already_down 路径 AR 门限收紧：0.6 → 0.4
-- `min_standing_ar` 降低：1.2 → 1.0
+- ByteTracker 集成，幽灵目标机制
+- EMA + Savitzky-Golay 降噪
+- 四路检测 + 滑动窗口 + 持续时间确认
 
-**UI 优化:**
-- 标签移入 bbox 内部顶部，添加半透明背景矩形
-- 幽灵目标灰色虚线框 + "LOST" 标签
+### v1.0 — 初始化 (2026-05-11)
 
-**配置化:**
-- 新增 `config.yaml`：所有阈值、窗口、超时参数集中配置，无需改代码
-- 新增 `config.py`：配置加载器
+- YOLOv8-Pose 单摄像头实时跌倒检测
 
-**测试完善:**
-- 53 个测试用例全部通过（跌倒场景 + 物理特征 + 跟踪器 + 跨摄像头匹配）
-- 测试数据适配 3.5 秒持续时间
+---
 
-### 2026-05-13（v1）
+## Roadmap
 
-- 更新部署教程与学习笔记（新增调试问题记录、架构说明、模拟测试说明）
-- 更新 README.md 和使用教程
+```
+v3.5 ✅  Fault-Tolerant Runtime (StateMachine / Backpressure / Degradation / Recovery)
+v3.4 ✅  Runtime Engine (Session / EventBus / Scheduler / Worker / Registry)
+v3.3 ✅  Pure Runtime Refactor (object pipeline, zero dict leak)
+v3.2 ✅  Runtime Core (Detection / TrackState / Event / Pipeline)
+v3.1 ✅  Backend Abstraction (Ultralytics / ONNX / factory)
+v3.0 ✅  SDK + Headless + Edge config (current baseline)
+v2.0 ✅  ByteTrack + EMA/SG + 4-path fall detection
+v4.0 🔜  OpenVINO / NCNN backend
+v4.1 🔜  TensorRT acceleration (YOLOv8-Pose 2-3x speedup)
+v5.0 🔜  Multi-camera RTSP streaming
+v6.0 🔜  Web Dashboard (FastAPI + WebSocket)
+v7.0 🔜  Multi-Model Runtime (Face + Fall + Fire + Smoke)
+v8.0 🔜  MQTT / Kafka event bus
+```
 
-### 2026-05-12
+---
 
-**核心修复:**
-- 修复双摄模式 `fall_state` 每帧重置导致跌倒检测失效的严重 bug，新增 `fall_state_store` 跨帧持久化
-- 修复 numpy view 跨进程序列化数据丢失（`.copy()` + `float()` 转换）
-- 修复跌倒确认后因物理信号消失而自动重置的问题，新增状态粘性机制
-- 修复 `initial_ar` 保护过于严格（坐姿首次检测后永久屏蔽），改为只屏蔽 AR 路径
-- 修复 `is_potential_fall` 可能为 `None` 导致 `sum()` 报 TypeError 的 bug
-- 修复 camera_process 和 main 双重调用 `evaluate_fall` 导致角度不一致
-- 添加恢复检测：AR 回升到基线 70% 自动重置跌倒状态
+## FAQ
 
-**新增功能:**
-- 新增 `test_fall_detection.py` 模拟测试（11 个场景全部通过）
-- 新增 ROI 二次推理（对潜在跌倒区域再检测，过滤假检）
-- 新增四路跌倒检测：几何(AR+角度) + 物理(RE/GF/头部下降) + 侧倒 + 已在地面
-- 新增幽灵目标机制（跌倒目标保持 30 秒不删除）
-- 新增双摄像头支持（多进程 + 跨摄像头匹配）
+<details>
+<summary><b>What backends are supported?</b></summary>
 
-### 2026-05-11
+Ultralytics (PyTorch) and ONNX Runtime (zero PyTorch). Switch via `backend="ultralytics"` or `backend="onnx"`. OpenVINO / NCNN / TensorRT reserved.
+</details>
 
-- 初始化项目：YOLOv8-Pose 单摄像头实时跌倒检测
+<details>
+<summary><b>How do I run on Raspberry Pi?</b></summary>
+
+```bash
+detector = FallDetector(
+    model_path="yolov8n-pose.onnx",
+    backend="onnx",
+    input_size=320,
+    inference_interval=3,
+    enable_roi=False,
+    enable_visualization=False,
+    max_persons=2,
+)
+```
+</details>
+
+<details>
+<summary><b>Does the Runtime survive camera disconnect?</b></summary>
+
+Yes. FaultRecovery auto-reconnects with retry. Chaos test confirms RUNNING state after camera disconnect / CPU spike / queue overflow.
+</details>
+
+<details>
+<summary><b>How do I run tests?</b></summary>
+
+```bash
+python -m pytest test_*.py -q
+```
+
+227 tests, ~7 seconds, zero hardware dependencies.
+</details>
+
+<details>
+<summary><b>Can I integrate this with another project?</b></summary>
+
+```python
+from fall_detection import FallDetector
+detector = FallDetector(...)
+result = detector.process_frame(frame, camera_id="entrance_1")
+# result is JSON-friendly dict with persons / events / diagnostics
+```
+</details>
+
+<details>
+<summary><b>What's the difference between Demo and Edge mode?</b></summary>
+
+| | Demo | Edge |
+|---|---|---|
+| Input size | 640 | 320 |
+| Inference interval | 1 | 2 |
+| ROI | on | off |
+| Visualization | yes | optional |
+| Max persons | unlimited | 3 |
+</details>
+
+---
+
+## License
+
+MIT License
+
+---
+
+<p align="center">
+  <sub>Built for edge AI and fault-tolerant real-time vision monitoring.</sub>
+</p>
